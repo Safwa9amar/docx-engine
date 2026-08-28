@@ -8,6 +8,7 @@ import {
   makeParagraphXml,
   makeParagraphNode,
   makeStyledParagraphXml,
+  makeParagraphXmlLike,
   paragraphText,
   paragraphStyleId,
   setParagraphText,
@@ -271,5 +272,47 @@ describe("OrderedBody — legacy-compatible exports", () => {
     expect(order.every((i) => i > -1)).toBe(true);
     expect(order).toEqual([...order].sort((a, b) => a - b));
     expect(xml).toContain('<w:pPr><w:pStyle w:val="Heading1"/><w:bidi/><w:jc w:val="right"/><w:outlineLvl w:val="0"/></w:pPr>');
+  });
+});
+
+
+// ── Run tabs vs tab-stop definitions ────────────────────────────────────────
+// A TOC entry is `text<w:tab/>page`; dropping the run tab glued the two into
+// "مقدمة5" everywhere the flat text surfaces. The trap: `<w:tab>` ALSO appears
+// inside `<w:pPr><w:tabs>` as tab-stop DEFINITIONS, which are geometry — not
+// characters — and must never read as text.
+describe("paragraphText — run tabs", () => {
+  test("a run's <w:tab/> reads as \\t; a pPr tab STOP does not", () => {
+    const xml =
+      `<w:p><w:pPr><w:pStyle w:val="TOC1"/>` +
+      `<w:tabs><w:tab w:val="right" w:leader="dot" w:pos="9350"/></w:tabs><w:bidi/></w:pPr>` +
+      `<w:r><w:t>مقدمة</w:t></w:r>` +
+      `<w:r><w:tab/></w:r>` +
+      `<w:fldSimple w:instr=" PAGEREF _Toc1 \\h "><w:r><w:t>5</w:t></w:r></w:fldSimple>` +
+      `</w:p>`;
+    expect(paragraphText(xml)).toBe("مقدمة\t5");
+  });
+
+  test("a paragraph with only tab STOPS and no run tab has no \\t at all", () => {
+    const xml =
+      `<w:p><w:pPr><w:tabs><w:tab w:val="left" w:pos="720"/><w:tab w:val="right" w:pos="9350"/></w:tabs></w:pPr>` +
+      `<w:r><w:t>plain</w:t></w:r></w:p>`;
+    expect(paragraphText(xml)).toBe("plain");
+  });
+});
+
+describe("paragraph writers — tabs round-trip", () => {
+  test("a \\t in edited text is written as a real <w:tab/>, and reads back", () => {
+    const xml = makeStyledParagraphXml("مقدمة\t5", { styleId: "TOC1", rtl: true });
+    expect(xml).toContain("<w:tab/>");
+    expect(xml).not.toContain("\t");
+    expect(paragraphText(xml)).toBe("مقدمة\t5");
+  });
+
+  test("makeParagraphXmlLike keeps the template's style and writes the tab", () => {
+    const template = `<w:p><w:pPr><w:pStyle w:val="TOC2"/></w:pPr><w:r><w:t>old</w:t></w:r></w:p>`;
+    const xml = makeParagraphXmlLike(template, "label\t12");
+    expect(xml).toContain('<w:pStyle w:val="TOC2"/>');
+    expect(paragraphText(xml)).toBe("label\t12");
   });
 });

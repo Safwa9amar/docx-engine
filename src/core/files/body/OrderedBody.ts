@@ -415,10 +415,24 @@ const PPR_SECTPR_RE = /<w:sectPr\b[^>]*>[\s\S]*?<\/w:sectPr>|<w:sectPr\b[^>]*\/>
  * The template's `<w:sectPr>` is dropped — cloning it would duplicate a section
  * break and repaginate the document.
  */
+/**
+ * A run's content for `text`: `<w:t>` pieces with a real `<w:tab/>` wherever
+ * the text holds "\t". The mirror of paragraphText's tab reading — a TOC entry
+ * edited as "label\tpage" must come back as `label<w:tab/>page`, or the tab
+ * STOP it was written for has nothing to act on and Word shows a glued line.
+ * One run may hold several `<w:t>` and `<w:tab/>` children (CT_R allows it).
+ */
+function runContentXml(text: string): string {
+  return text
+    .split("\t")
+    .map((piece) => (piece ? `<w:t xml:space="preserve">${escapeXmlText(piece)}</w:t>` : ""))
+    .join("<w:tab/>");
+}
+
 export function makeParagraphXmlLike(templateXml: string, text: string): string {
   const pPr = paragraphPropsXml(templateXml).replace(PPR_SECTPR_RE, "");
   const rPr = paragraphRunPropsXml(templateXml);
-  return `<w:p>${pPr}<w:r>${rPr}<w:t xml:space="preserve">${escapeXmlText(text)}</w:t></w:r></w:p>`;
+  return `<w:p>${pPr}<w:r>${rPr}${runContentXml(text)}</w:r></w:p>`;
 }
 
 /** {@link makeParagraphXmlLike} as a `BodyBlock`. */
@@ -475,7 +489,7 @@ export function makeStyledParagraphXml(text: string, opts: StyledParagraphOption
   if (opts.rtl) rPrParts.push(`<w:rtl/>`);
   const rPr = rPrParts.length ? `<w:rPr>${rPrParts.join("")}</w:rPr>` : "";
 
-  const run = text ? `<w:r>${rPr}<w:t xml:space="preserve">${escapeXmlText(text)}</w:t></w:r>` : "";
+  const run = text ? `<w:r>${rPr}${runContentXml(text)}</w:r>` : "";
   return `<w:p>${pPr}${run}</w:p>`;
 }
 
@@ -625,11 +639,23 @@ export function nextDrawingId(documentXml: string): number {
 
 /** Concatenate the decoded text of every `<w:t ...>...</w:t>` in a block. */
 export function paragraphText(xml: string): string {
-  // Match `<w:t>`/`<w:t ...>...</w:t>` (NOT `<w:tab>`/`<w:tbl>`), and `<w:t/>`.
+  // Match `<w:t>`/`<w:t ...>...</w:t>` (NOT `<w:tab>`/`<w:tbl>`), `<w:t/>` — and
+  // a run's `<w:tab/>` as "\t": a TOC entry is `text<w:tab/>page`, and dropping
+  // the tab glued the two ("مقدمة5") everywhere this text surfaces.
+  //
+  // `<w:pPr>` spans are skipped WHOLESALE first, because tab-stop DEFINITIONS
+  // (`<w:tabs><w:tab w:val="right" …/></w:tabs>`) live there and would read as
+  // phantom tabs. Alternation order does the skipping: the pPr branch consumes
+  // its whole span before the tab branch can see inside it.
   let out = "";
-  const re = /<w:t(\/)?(?:\s[^>]*?)?(\/)?>/g;
+  const re = /<w:pPr\b[^>]*\/>|<w:pPr\b[^>]*>[\s\S]*?<\/w:pPr>|<w:tab\b[^>]*\/>|<w:t(\/)?(?:\s[^>]*?)?(\/)?>/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(xml)) !== null) {
+    if (m[0].startsWith("<w:pPr")) continue; // tab STOPS, not tab characters
+    if (m[0].startsWith("<w:tab")) {
+      out += "\t";
+      continue;
+    }
     const selfClosed = m[1] === "/" || m[2] === "/";
     if (selfClosed) continue; // <w:t/> → empty
     const contentStart = re.lastIndex;

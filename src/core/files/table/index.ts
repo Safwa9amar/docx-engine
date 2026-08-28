@@ -1,6 +1,22 @@
 import { TableObject, TableRow, TableCell, CellMargins } from "./types";
 import { parseXml } from "@/utils/xmlUtils";
 
+/** Undo Table.fromXml's sentinel encoding: every U+E000 in any text value
+ *  becomes the space it stood for. Walks the whole parsed tree — the sentinel
+ *  is only ever injected into `<w:t>` bodies, so a global walk is safe. */
+function restoreSentinelSpaces(node: unknown): void {
+  if (node === null || typeof node !== "object") return;
+  const obj = node as Record<string, unknown>;
+  for (const key of Object.keys(obj)) {
+    const v = obj[key];
+    if (typeof v === "string") {
+      if (v.includes("\uE000")) obj[key] = v.replace(/\uE000/g, " ");
+    } else {
+      restoreSentinelSpaces(v);
+    }
+  }
+}
+
 export interface CellTextOptions {
   bold?: boolean;
   italic?: boolean;
@@ -904,7 +920,30 @@ export class Table {
    * full-document path — e.g. `(await Table.fromXml(block.xml)).getAllCellText()`.
    */
   public static async fromXml(tableXml: string): Promise<Table> {
-    const parsed = await parseXml(tableXml);
+    // trim: false — NOT the parser default. A table's cell text lives in
+    // `<w:t>` runs, and Word splits a sentence across many runs with the
+    // spaces riding at run edges or in space-only `xml:space="preserve"` runs.
+    // The trimming parse deleted those spaces; because mutateTable round-trips
+    // fromXml → buildXml → save, every table EDIT then wrote the glued text
+    // back into the document — permanent data loss, one table op at a time.
+    // Untrimmed parsing is safe for this XML: real Word document.xml is
+    // single-line, and mutateTable rebuilds with pretty:false, so
+    // whitespace-only inter-element text nodes do not occur here.
+    // ⚠️ Space-only runs need MORE than trim:false. xml2js drops whitespace-
+    // only text from any node that has attributes — and Word's space between
+    // two styled words is exactly `<w:t xml:space="preserve"> </w:t>`. The
+    // space is unrecoverable after the parse, so it is protected before it:
+    // each space in a space-only `<w:t>` body becomes a private-use sentinel
+    // (non-whitespace, so xml2js keeps it), and the parsed object is walked
+    // once to restore real spaces. The in-memory table is then correct for
+    // every reader AND for mutateTable's buildXml→save round-trip — no decode
+    // at any exit point.
+    const protectedXml = tableXml.replace(
+      /(<w:t(?:\s[^>]*)?>)( +)(<\/w:t>)/g,
+      (_m, open: string, spaces: string, close: string) => open + "\uE000".repeat(spaces.length) + close,
+    );
+    const parsed = await parseXml(protectedXml, { trim: false });
+    restoreSentinelSpaces(parsed);
     // parseXml wraps the element under its root key ("w:tbl"); unwrap to the
     // inner object the Table class expects ({ "w:tblPr", "w:tblGrid", "w:tr" }).
     const inner =
