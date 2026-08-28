@@ -1,23 +1,32 @@
 {
-  "name": "mdocxengine",
-  "version": "1.0.0",
-  "description": "A TypeScript library for reading, manipulating, and writing Word (.docx) files with byte-perfect round-trip fidelity",
+  "name": "docx-engine",
+  "version": "2.0.0",
+  "description": "Edit existing Word (.docx) files without mangling them — byte-faithful round-trip, real TOC/caption/footnote/citation structures, first-class Arabic RTL, and a validating docx doctor on every write. TypeScript, no Word or LibreOffice needed.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "module": "dist/index.mjs",
   "keywords": [
     "docx",
     "word",
-    "document",
-    "office",
-    "openxml",
     "ooxml",
-    "paragraph",
-    "table",
-    "header",
-    "footer",
-    "style",
-    "template"
+    "openxml",
+    "office",
+    "document",
+    "edit",
+    "round-trip",
+    "rtl",
+    "arabic",
+    "bidi",
+    "toc",
+    "table-of-contents",
+    "captions",
+    "footnotes",
+    "citations",
+    "headers",
+    "footers",
+    "sections",
+    "tables",
+    "typescript"
   ],
   "author": "Hamza Safwan",
   "license": "ISC",
@@ -85,5 +94,12 @@
     "vite-plugin-dts": "^4.5.4",
     "vite-tsconfig-paths": "^5.1.4",
     "vitest": "^3.2.4"
+  },
+  "homepage": "https://github.com/hamzasafwan/mdocxengine#readme",
+  "bugs": {
+    "url": "https://github.com/hamzasafwan/mdocxengine/issues"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

@@ -2107,21 +2107,6 @@ export declare function makeParagraphNodeLike(templateXml: string, text: string)
  */
 export declare function makeParagraphXml(text: string, styleId?: string, rtl?: boolean): string;
 
-/**
- * Build a `<w:p>` carrying `text` but wearing `templateXml`'s clothes: its whole
- * `<w:pPr>` (style, alignment, indent, spacing, bidi, numbering) plus the run
- * properties of its first text-bearing run.
- *
- * Use this — NOT `makeParagraphXml`/`makeStyledParagraphXml` — whenever a new
- * paragraph is added beside existing content (split, range rewrite, AI insert).
- * Rebuilding from a styleId alone only carries what the style sheet defines, and
- * in an imported thesis that is usually nothing: the formatting lives on the
- * runs. The result is a new paragraph that renders identically to the one it was
- * derived from, instead of falling back to renderer defaults.
- *
- * The template's `<w:sectPr>` is dropped — cloning it would duplicate a section
- * break and repaginate the document.
- */
 export declare function makeParagraphXmlLike(templateXml: string, text: string): string;
 
 /** Build a fully-formatted paragraph `BodyBlock` (string-based, byte-safe). */
