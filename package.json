@@ -32,7 +32,7 @@
   "license": "ISC",
   "repository": {
     "type": "git",
-    "url": "https://github.com/hamzasafwan/mdocxengine"
+    "url": "git+https://github.com/Safwa9amar/docx-engine.git"
   },
   "publishConfig": {
     "access": "public"
@@ -95,9 +95,9 @@
     "vite-tsconfig-paths": "^5.1.4",
     "vitest": "^3.2.4"
   },
-  "homepage": "https://github.com/hamzasafwan/mdocxengine#readme",
+  "homepage": "https://github.com/Safwa9amar/docx-engine#readme",
   "bugs": {
-    "url": "https://github.com/hamzasafwan/mdocxengine/issues"
+    "url": "https://github.com/Safwa9amar/docx-engine/issues"
   },
   "engines": {
     "node": ">=18"
