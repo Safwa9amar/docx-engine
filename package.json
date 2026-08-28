@@ -1,5 +1,5 @@
 {
-  "name": "docx-engine",
+  "name": "@kwill/docx-engine",
   "version": "2.0.0",
   "description": "Edit existing Word (.docx) files without mangling them — byte-faithful round-trip, real TOC/caption/footnote/citation structures, first-class Arabic RTL, and a validating docx doctor on every write. TypeScript, no Word or LibreOffice needed.",
   "main": "dist/index.js",

@@ -1,11 +1,11 @@
-# docx-engine
+# @kwill/docx-engine
 
 **Edit existing Word (.docx) files without mangling them.**
 
-[![npm](https://img.shields.io/npm/v/docx-engine)](https://www.npmjs.com/package/docx-engine)
+[![npm](https://img.shields.io/npm/v/%40kwill%2Fdocx-engine)](https://www.npmjs.com/package/@kwill/docx-engine)
 [![license: ISC](https://img.shields.io/badge/license-ISC-green.svg)](./LICENSE)
 
-`docx-engine` is a TypeScript library for reading and editing `.docx` files that
+`@kwill/docx-engine` is a TypeScript library for reading and editing `.docx` files that
 already exist — theses, contracts, reports — by operating directly on the Office
 Open XML inside the package. Everything you don't touch round-trips byte-for-byte.
 What you do touch is written as the real Word structure (a `TOC` field, a `SEQ`
@@ -24,13 +24,13 @@ Formerly published as `mdocxengine` (1.0.0); this is the same engine, renamed.
 ## Install
 
 ```bash
-npm i docx-engine
+npm i @kwill/docx-engine
 ```
 
 ## Quick start
 
 ```ts
-import { Doc } from "docx-engine";
+import { Doc } from "@kwill/docx-engine";
 
 const doc = await Doc.open("memoire.docx");          // path or Buffer
 
