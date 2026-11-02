@@ -552,24 +552,32 @@ export class MergeManager {
     // A footnote's `r:embed` resolves against word/_rels/footnotes.xml.rels, not
     // the document rels — so its images are copied into THAT part's rels.
     const srcRelsXml = source.zip.readAsText("word/_rels/footnotes.xml.rels");
-    const fnRels: Record<string, string> = {};
+    const fnRels: Record<string, { type: string; target: string; external: boolean }> = {};
     for (const m of srcRelsXml.matchAll(/<Relationship\b[^>]*>/g)) {
       const id = /\bId="([^"]+)"/.exec(m[0])?.[1];
       const target = /\bTarget="([^"]+)"/.exec(m[0])?.[1];
-      if (id && target && !/TargetMode="External"/.test(m[0])) fnRels[id] = target;
+      const type = /\bType="([^"]+)"/.exec(m[0])?.[1] ?? "";
+      if (id && target) fnRels[id] = { type, target, external: /TargetMode="External"/.test(m[0]) };
     }
+    const fnRelMgr = new RelManager(this.zip, "word/_rels/footnotes.xml.rels");
     const rewrite = async (xml: string): Promise<string> => {
       const ids = new Map<string, string>();
-      for (const m of xml.matchAll(/\br:embed="([^"]+)"/g)) {
-        const target = fnRels[m[1]];
-        const bytes = target && source.zip.getEntry(resolvePartPath("word/footnotes.xml", target));
-        if (!bytes) continue;
-        const ext = (/\.([a-zA-Z0-9]+)$/.exec(target)?.[1] ?? "png").toLowerCase();
-        if (!ids.has(m[1])) {
-          ids.set(m[1], await this.media.addImageToPartRels("word/footnotes.xml", bytes.getData(), ext));
+      for (const m of xml.matchAll(/\br:(?:id|embed|link)="([^"]+)"/g)) {
+        const rel = fnRels[m[1]];
+        if (!rel || ids.has(m[1])) continue;
+        if (rel.external) {
+          // Hyperlinks (and linked images) live in the footnotes part's OWN rels.
+          const newId = await fnRelMgr.genId();
+          await fnRelMgr.addRelationship(newId, rel.type, rel.target, "External");
+          ids.set(m[1], newId);
+          continue;
         }
+        const entry = source.zip.getEntry(resolvePartPath("word/footnotes.xml", rel.target));
+        if (!entry) continue;
+        const ext = (/\.([a-zA-Z0-9]+)$/.exec(rel.target)?.[1] ?? "png").toLowerCase();
+        ids.set(m[1], await this.media.addImageToPartRels("word/footnotes.xml", entry.getData(), ext));
       }
-      return this.applyAttrMap(xml, ["r:embed"], Object.fromEntries(ids));
+      return this.applyAttrMap(xml, ["r:embed", "r:link", "r:id"], Object.fromEntries(ids));
     };
     return this.footnotes.copyFootnotesVerbatim(sourceFootnotesXml, refIds, rewrite);
   }

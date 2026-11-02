@@ -235,4 +235,34 @@ describe("MergeManager — VML pictures and OLE objects survive a merge", () => 
     expect(embeds[0]).toBe(embeds[1]);
     expect(embeds[2]).toBe("rIdGone");
   });
+
+  test("hyperlinks inside a footnote are carried; anchors are untouched", async () => {
+    const t = await target();
+    const s = await Mdocxengine.loadFromBuffer(await source({ tag: 10, footnoteImage: true }));
+    const fx = s.zip.readAsText("word/footnotes.xml")!;
+    const links =
+      '<w:hyperlink r:id="rIdH"><w:r><w:t>site</w:t></w:r></w:hyperlink>' +
+      '<w:hyperlink w:anchor="bm1"><w:r><w:t>here</w:t></w:r></w:hyperlink>';
+    const patched = fx.replace(/(<w:footnote\b[^>]*w:id="1"[^>]*>[\s\S]*?)(<\/w:p>\s*<\/w:footnote>)/, `$1${links}$2`);
+    expect(patched).not.toBe(fx);
+    s.zip.addFile("word/footnotes.xml", Buffer.from(patched, "utf8"));
+    const rels = s.zip.readAsText("word/_rels/footnotes.xml.rels")!.replace(
+      "</Relationships>",
+      `<Relationship Id="rIdH" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.org/x" TargetMode="External"/></Relationships>`,
+    );
+    s.zip.addFile("word/_rels/footnotes.xml.rels", Buffer.from(rels, "utf8"));
+    await t.merge.appendDocument(s.zip.toBuffer());
+
+    const out = t.zip.readAsText("word/footnotes.xml")!;
+    const ids = [...out.matchAll(/<w:hyperlink\b[^>]*\br:id="([^"]+)"/g)].map((m) => m[1]);
+    expect(ids).toHaveLength(1);
+    const xml = t.zip.readAsText("word/_rels/footnotes.xml.rels")!;
+    const tag = [...xml.matchAll(/<Relationship\b[^>]*>/g)].map((m) => m[0]).find((x) => x.includes(`Id="${ids[0]}"`))!;
+    expect(tag).toContain('Target="https://example.org/x"');
+    expect(tag).toContain('TargetMode="External"');
+    expect(tag).toMatch(/relationships\/hyperlink"/);
+    expect(out).toContain('<w:hyperlink w:anchor="bm1">');
+    // the footnote image still resolves too
+    expect(out).toMatch(/r:embed="rId\d+"/);
+  });
 });
