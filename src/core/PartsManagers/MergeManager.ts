@@ -1267,8 +1267,8 @@ export class MergeManager {
 
     const { absMax, numMax, picMax } = await this.numbering.maxIds();
     let nextAbs = absMax + 1;
-    // Above what this document POINTS at too: a numId with no definition prints nothing, and a
-    // copied list taking that id would number paragraphs that never were.
+    // Above what this document POINTS at too: a numId with no definition prints a default "1."
+    // of its own (measured), and a copied list taking that id would change what those paragraphs say.
     let nextNum = Math.max(numMax, this.highestNumIdInUse()) + 1;
     let nextPic = picMax + 1;
 
@@ -1336,9 +1336,10 @@ export class MergeManager {
     }
 
     await this.numbering.appendRawDefinitions(addAbs, addNum, addPic);
-    // A numId with no list behind it prints nothing in the source, and has to go on printing
-    // nothing: left as it is, it would fall into whatever list this document has of that id.
-    for (const id of styles.numIds) if (numIdMap[id] == null && id !== "0") numIdMap[id] = "0";
+    // A numId with no list behind it prints a default "1." of its own, and has to go on doing so:
+    // left as it is, it would fall into whatever list this document has of that id. Each stays
+    // missing under an id of its own, since Word counts each on its own.
+    for (const id of styles.numIds) if (numIdMap[id] == null && id !== "0") numIdMap[id] = String(nextNum++);
     return numIdMap;
   }
 

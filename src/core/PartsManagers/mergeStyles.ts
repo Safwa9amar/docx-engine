@@ -129,11 +129,15 @@ function levelsDefinition(side: Side, numId: string, seen = new Set<string>()): 
   return (via && levelsDefinition(side, via, seen)) ?? abs;
 }
 
-/** What a list prints: two lists with the same print count on as one. Null: no such list. */
-function listPrint(side: Side, numId: string): string | null {
+/**
+ * What a list prints: two lists with the same print count on as one. A numId with no definition is
+ * no absence: Word gives it a default "1." of its own (measured, from a paragraph and from a style),
+ * so it prints something too.
+ */
+function listPrint(side: Side, numId: string): string {
   const num = numOf(side, numId);
   const abs = levelsDefinition(side, numId);
-  if (!num || !abs) return null;
+  if (!num || !abs) return "no definition";
   const level = (l: any) => [l?.$?.["w:ilvl"], nodeVal(l, "w:start"), nodeVal(l, "w:numFmt"), nodeVal(l, "w:lvlText"), nodeVal(l, "w:suff")];
   return JSON.stringify([
     asArray(abs["w:lvl"]).map(level),
@@ -306,7 +310,7 @@ export function planStyles(input: StylePlanInput): StylePlan {
       if (d.kind === "alias") return "as-is";
       if (d.kind === "merge") {
         const n = effectiveList(tgt, d.id);
-        return n && listPrint(tgt, n.numId) !== null ? { numId: n.numId, style: d.id, n } : null;
+        return n ? { numId: n.numId, style: d.id, n } : null;
       }
       const numId = src.byId.get(cur)?.numId;
       if (numId !== undefined) return numId === "0" ? null : "as-is";
@@ -316,9 +320,8 @@ export function planStyles(input: StylePlanInput): StylePlan {
 
   const stamps = new Map<string, { numId: string; ilvl: string }>();
   for (const id of paragraphRefs) {
-    if (!src.byId.has(id) || decide(id).kind === "alias") continue;
-    const mine = effectiveList(src, id);
-    const list = mine && listPrint(src, mine.numId) !== null ? mine : null;
+    if (!src.byId.has(id)) continue;
+    const list = effectiveList(src, id);
     const here = landedList(id);
     if (here === "as-is") continue;
     if (!list) {

@@ -162,17 +162,26 @@ describe("addNumberingDefinition on a document with no numbering part", () => {
   });
 });
 
-describe("merge: a copied list never takes an id the target already points at", () => {
-  const LIST = `<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>`;
+/**
+ * A numId with no definition is no absence. Measured in real Word: it prints a default "1.",
+ * each missing id counting on its own, with or without a numbering part, from a paragraph or
+ * from a style. So one has to stay missing on both sides of a merge: the target's must not be
+ * filled by a copied list, and the source's must not fall into a list of that id here.
+ */
+describe("merge: a numId with no definition stays one", () => {
+  const LIST = `<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="3"><w:abstractNumId w:val="0"/></w:num>`;
   const ITEM = (numId: number, t: string) => P(t, `<w:numPr><w:ilvl w:val="0"/><w:numId w:val="${numId}"/></w:numPr>`);
+  const numIdOf = (doc: string, text: string) => new RegExp(`<w:numId w:val="(\\d+)"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">${text}`).exec(doc)?.[1];
+  const defined = (numbering: string) => [...numbering.matchAll(/<w:num\b[^>]*\bw:numId="(\d+)"/g)].map((m) => m[1]);
 
-  test("a target's numId with no definition stays dangling: Word prints nothing there, and must go on printing nothing", async () => {
-    const t = await Mdocxengine.loadFromBuffer(fixture({ body: ITEM(1, "unnumbered in Word") + ITEM(3, "this one too") }));
-    await t.merge.appendDocument(fixture({ body: ITEM(1, "item"), numbering: numberingPart(LIST) }));
+  test("a target's: a copied list takes an id above it", async () => {
+    const t = await Mdocxengine.loadFromBuffer(fixture({ body: ITEM(3, "missing here") + ITEM(5, "this one too") }));
+    await t.merge.appendDocument(fixture({ body: ITEM(3, "item"), numbering: numberingPart(LIST) }));
     const doc = t.zip.readAsText("word/document.xml")!;
-    const copied = /item/.test(doc) ? /<w:numId w:val="(\d+)"\/><\/w:numPr><\/w:pPr><w:r><w:t xml:space="preserve">item/.exec(doc)![1] : "";
-    expect(Number(copied)).toBeGreaterThan(3);
-    expect(t.zip.readAsText("word/numbering.xml")).not.toMatch(/w:numId="[13]"/);
+    expect(numIdOf(doc, "missing here")).toBe("3");
+    expect(numIdOf(doc, "this one too")).toBe("5");
+    expect(Number(numIdOf(doc, "item"))).toBeGreaterThan(5);
+    expect(defined(t.zip.readAsText("word/numbering.xml")!)).toEqual([numIdOf(doc, "item")]);
   });
 
   test("the same for an id only the target's styles or notes name", async () => {
@@ -183,39 +192,52 @@ describe("merge: a copied list never takes an id the target already points at", 
         footnotes: notesPart("footnote", note("footnote", 1, `<w:p><w:pPr><w:numPr><w:numId w:val="7"/></w:numPr></w:pPr></w:p>`)),
       }),
     );
-    await t.merge.appendDocument(fixture({ body: ITEM(1, "item"), numbering: numberingPart(LIST) }));
-    expect(Number(/<w:num w:numId="(\d+)"/.exec(t.zip.readAsText("word/numbering.xml")!)![1])).toBeGreaterThan(7);
+    await t.merge.appendDocument(fixture({ body: ITEM(3, "item"), numbering: numberingPart(LIST) }));
+    expect(Number(defined(t.zip.readAsText("word/numbering.xml")!)[0])).toBeGreaterThan(7);
   });
-});
 
-describe("merge: a source's numId with no list behind it prints nothing here either", () => {
-  const LIST = `<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="3"><w:abstractNumId w:val="0"/></w:num>`;
-  const ITEM = (numId: number, t: string) => P(t, `<w:numPr><w:ilvl w:val="0"/><w:numId w:val="${numId}"/></w:numPr>`);
   const merged = async (source: Parameters<typeof fixture>[0]) => {
     const t = await Mdocxengine.loadFromBuffer(fixture({ body: ITEM(3, "mine"), numbering: numberingPart(LIST) }));
     await t.merge.appendDocument(fixture(source));
-    return { doc: t.zip.readAsText("word/document.xml")!, numbering: t.zip.readAsText("word/numbering.xml")! };
+    return { doc: t.zip.readAsText("word/document.xml")!, numbering: t.zip.readAsText("word/numbering.xml")!, styles: t.zip.readAsText("word/styles.xml")! };
   };
-  const numIdOf = (doc: string, text: string) => new RegExp(`<w:numId w:val="(\\d+)"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">${text}`).exec(doc)?.[1];
 
-  test("no definition in the source: it does not fall into the target's list of that id", async () => {
-    const { doc } = await merged({ body: ITEM(3, "theirs") });
+  test("a source's: it does not fall into the target's list of that id, and two ids stay two", async () => {
+    const { doc, numbering } = await merged({ body: ITEM(3, "theirs") + ITEM(3, "theirs too") + ITEM(4, "another") });
     expect(numIdOf(doc, "mine")).toBe("3");
-    expect(numIdOf(doc, "theirs")).toBe("0");
+    const id = numIdOf(doc, "theirs")!;
+    expect(["0", "3"]).not.toContain(id);
+    expect(numIdOf(doc, "theirs too")).toBe(id);
+    expect(numIdOf(doc, "another")).not.toBe(id);
+    expect(defined(numbering)).toEqual(["3"]);
   });
-  test("a num whose abstractNum is not there: the same, and no such num is copied", async () => {
+  test("a num whose abstractNum is not there is the same, and no such num is copied", async () => {
     const { doc, numbering } = await merged({ body: ITEM(1, "theirs"), numbering: numberingPart(`<w:num w:numId="1"><w:abstractNumId w:val="44"/></w:num>`) });
-    expect(numIdOf(doc, "theirs")).toBe("0");
-    expect(numbering.match(/<w:num\b/g)).toHaveLength(1);
+    expect(["0", "1", "3"]).not.toContain(numIdOf(doc, "theirs"));
+    expect(defined(numbering)).toEqual(["3"]);
   });
-  test("a style pointing at no list: the same", async () => {
-    const t = await Mdocxengine.loadFromBuffer(fixture({ body: P("mine"), numbering: numberingPart(LIST) }));
-    await t.merge.appendDocument(fixture({ body: P("theirs", '<w:pStyle w:val="S"/>'), styles: withNormal(`<w:style w:type="paragraph" w:customStyle="1" w:styleId="S"><w:name w:val="S"/><w:pPr><w:numPr><w:numId w:val="3"/></w:numPr></w:pPr></w:style>`) }));
-    expect(t.zip.readAsText("word/styles.xml")).toContain('<w:numId w:val="0"/>');
+  test("a style naming no list: the same", async () => {
+    const { styles } = await merged({ body: P("theirs", '<w:pStyle w:val="S"/>'), styles: withNormal(`<w:style w:type="paragraph" w:customStyle="1" w:styleId="S"><w:name w:val="S"/><w:pPr><w:numPr><w:numId w:val="3"/></w:numPr></w:pPr></w:style>`) });
+    const id = /w:styleId="S"[\s\S]*?<w:numId w:val="(\d+)"/.exec(styles)![1];
+    expect(["0", "3"]).not.toContain(id);
   });
   test("a target with no numbering part gets none for it", async () => {
     const t = await Mdocxengine.loadFromBuffer(fixture({ body: P("mine") }));
     await t.merge.appendDocument(fixture({ body: ITEM(3, "theirs") }));
     expect(t.zip.getEntry("word/numbering.xml")).toBeNull();
+  });
+  test("a built-in style's missing list against the target's unnumbered one: the paragraph keeps its default label", async () => {
+    const heading = (extra: string) => `<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/>${extra}</w:style>`;
+    const t = await Mdocxengine.loadFromBuffer(fixture({ body: P("mine"), styles: withNormal(heading("")) }));
+    await t.merge.appendDocument(fixture({ body: P("theirs", '<w:pStyle w:val="Heading1"/>'), styles: withNormal(heading('<w:pPr><w:numPr><w:numId w:val="9"/></w:numPr></w:pPr>')) }));
+    const id = /<w:numId w:val="(\d+)"\/><\/w:numPr><\/w:pPr><w:r><w:t xml:space="preserve">theirs/.exec(t.zip.readAsText("word/document.xml")!)?.[1];
+    expect(id).toBeDefined();
+    expect(id).not.toBe("0");
+  });
+  test("the target's style naming a missing list, the part's none: the paragraph turns it off", async () => {
+    const heading = (extra: string) => `<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/>${extra}</w:style>`;
+    const t = await Mdocxengine.loadFromBuffer(fixture({ body: P("mine"), styles: withNormal(heading('<w:pPr><w:numPr><w:numId w:val="9"/></w:numPr></w:pPr>')) }));
+    await t.merge.appendDocument(fixture({ body: P("theirs", '<w:pStyle w:val="Heading1"/>'), styles: withNormal(heading("")) }));
+    expect(t.zip.readAsText("word/document.xml")).toMatch(/<w:numId w:val="0"\/><\/w:numPr><\/w:pPr><w:r><w:t xml:space="preserve">theirs/);
   });
 });

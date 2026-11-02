@@ -82,6 +82,20 @@ describe("a style the target already has by name is never added beside it", () =
     expect(doc).not.toMatch(/w:val="(?:ac|a3)"/);
   });
 
+  test("a style only a note uses binds by name too, and the target's stays as it was", async () => {
+    const target = withNormal(style("paragraph", "FootnoteText", "footnote text", '<w:rPr><w:sz w:val="40"/></w:rPr>'));
+    const { styles, footnotes } = await merged(
+      { body: P("first"), styles: target },
+      {
+        body: refP("footnote", 1),
+        footnotes: notesPart("footnote", note("footnote", 1, `<w:p><w:pPr><w:pStyle w:val="Notedebasdepage"/></w:pPr><w:r><w:t>words</w:t></w:r></w:p>`)),
+        styles: withNormal(style("paragraph", "Notedebasdepage", "footnote text", '<w:rPr><w:sz w:val="16"/></w:rPr>')),
+      },
+    );
+    expect(styles).toBe(target);
+    expect(footnotes).toContain('<w:pStyle w:val="FootnoteText"/>');
+  });
+
   test("a style based on the source's default imports based on this document's", async () => {
     const { styles } = await merged(
       { body: P("first"), styles: withNormal() },
@@ -459,6 +473,26 @@ describe("a list defined through a list style", () => {
     const { styles, numbering } = await merged({ body: P("first", '<w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr>'), styles: withNormal(LIST_STYLE), numbering: NUMBERING }, { body: ITEM, styles: withNormal(LIST_STYLE), numbering: NUMBERING });
     expect(styleIds(styles)).toEqual(["Normal", "MyList"]);
     expect([...numbering.matchAll(/<w:(?:numStyleLink|styleLink) w:val="([^"]+)"/g)].every((m) => m[1] === "MyList")).toBe(true);
+  });
+});
+
+describe("a heading numbered through a list style", () => {
+  const LEVELS = `<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="(%1)"/><w:lvlJc w:val="left"/></w:lvl>`;
+  const LINKED = numberingPart(
+    `<w:abstractNum w:abstractNumId="0"><w:multiLevelType w:val="multilevel"/><w:styleLink w:val="L"/>${LEVELS}</w:abstractNum>` +
+      `<w:abstractNum w:abstractNumId="1"><w:multiLevelType w:val="multilevel"/><w:numStyleLink w:val="L"/></w:abstractNum>` +
+      `<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>`,
+  );
+  const LIST_STYLE = style("numbering", "L", "L List", '<w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr>', 'w:customStyle="1"');
+  const H = (numId: number) => style("paragraph", "Heading1", "heading 1", `<w:pPr><w:numPr><w:numId w:val="${numId}"/></w:numPr></w:pPr>`);
+
+  test("compares by the levels the list style holds: the same words run on", async () => {
+    const plain = numberingPart(`<w:abstractNum w:abstractNumId="0"><w:multiLevelType w:val="multilevel"/>${LEVELS}</w:abstractNum><w:num w:numId="5"><w:abstractNumId w:val="0"/></w:num>`);
+    const { doc } = await merged(
+      { body: P("one", '<w:pStyle w:val="Heading1"/>'), styles: withNormal(H(5)), numbering: plain },
+      { body: P("two", '<w:pStyle w:val="Heading1"/>'), styles: withNormal(H(2) + LIST_STYLE), numbering: LINKED },
+    );
+    expect(doc).not.toContain("<w:numPr>");
   });
 });
 

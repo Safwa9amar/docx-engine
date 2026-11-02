@@ -1441,7 +1441,7 @@ function checkReferences(zip: DocxZip, names: string[], present: Set<string>): F
         severity: "warning",
         part: "word/numbering.xml",
         count: missing.size,
-        message: `${missing.size} numbering id(s) are used by the content but never defined in numbering.xml. Those lists lose their bullets or numbers.`,
+        message: `${missing.size} numbering id(s) are used by the content but never defined in numbering.xml. Word gives those paragraphs a default "1." instead of the list they meant.`,
         detail: sample(missing),
         fixable: false,
       }));
