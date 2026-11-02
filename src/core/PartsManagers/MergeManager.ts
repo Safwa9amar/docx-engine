@@ -335,7 +335,7 @@ export class MergeManager {
   // a missing equation object is lost thesis content — so an unresolvable
   // reference THROWS rather than being dropped.
 
-  /** Attributes on `<v:imagedata>` that name a relationship. */
+  /** Attributes on `<v:imagedata>` / `<v:fill>` (picture fill) that name a relationship. */
   private static readonly VML_REL_ATTRS = ["r:id", "r:href", "o:relid"];
 
   /** Copy each VML image and OLE object referenced by the blocks; return
@@ -346,7 +346,7 @@ export class MergeManager {
     blocksXml: string,
   ): Promise<Record<string, string>> {
     const refs: { tag: string; attr: string; rId: string; ole: boolean }[] = [];
-    for (const m of blocksXml.matchAll(/<(v:imagedata|o:OLEObject)\b[^>]*>/g)) {
+    for (const m of blocksXml.matchAll(/<(v:imagedata|v:fill|o:OLEObject)\b[^>]*>/g)) {
       const ole = m[1] === "o:OLEObject";
       for (const attr of ole ? ["r:id"] : MergeManager.VML_REL_ATTRS) {
         const v = new RegExp(`\\b${attr}="([^"]+)"`).exec(m[0])?.[1];
@@ -396,7 +396,7 @@ export class MergeManager {
    *  open tags only (never another element's r:id). */
   private applyVmlOleMap(xml: string, idMap: Record<string, string>): string {
     if (Object.keys(idMap).length === 0) return xml;
-    return xml.replace(/<(?:v:imagedata|o:OLEObject)\b[^>]*>/g, (tag) =>
+    return xml.replace(/<(?:v:imagedata|v:fill|o:OLEObject)\b[^>]*>/g, (tag) =>
       tag.replace(/\b((?:r:id|r:href|o:relid)=")([^"]+)(")/g, (full, a, val, c) =>
         idMap[val] ? `${a}${idMap[val]}${c}` : full,
       ),

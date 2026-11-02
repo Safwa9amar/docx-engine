@@ -423,4 +423,25 @@ describe("MergeManager — VML pictures and OLE objects survive a merge", () => 
       expect(new Set(got.map((g) => g[0])).size).toBe(4);
     });
   });
+
+  test("a v:fill picture fill is remapped to its own copied image", async () => {
+    const t = await target();
+    const s = await Mdocxengine.loadFromBuffer(await source({ tag: 10 }));
+    await s.merge["rels"].addRelationship("rIdF", IMG, "media/fill1.png");
+    s.zip.addFile("word/media/fill1.png", png(77));
+    await s.document.saveBlocks([
+      {
+        kind: "paragraph",
+        tag: "w:p",
+        xml: `<w:p><w:r><w:pict ${NS_VO}><v:rect id="r1"><v:fill type="frame" r:id="rIdF" o:title=""/></v:rect></w:pict></w:r></w:p>`,
+      },
+    ]);
+    await t.merge.appendDocument(s.zip.toBuffer(), {});
+    const body = await bodyXml(t);
+    const rid = /<v:fill\b[^>]*\br:id="([^"]+)"/.exec(body)![1];
+    const rel = relsOf(t).find((r) => r.id === rid);
+    expect(rel, "fill rId must resolve").toBeDefined();
+    expect(rel!.type).toBe(IMG);
+    expect(t.zip.getEntry(`word/${rel!.target}`)!.getData().equals(png(77))).toBe(true);
+  });
 });
