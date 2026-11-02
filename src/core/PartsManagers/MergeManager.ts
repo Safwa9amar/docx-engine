@@ -92,6 +92,12 @@ function partRelsPath(part: string): string {
   return `${part.slice(0, i)}/_rels/${part.slice(i + 1)}.rels`;
 }
 
+interface IdPlan {
+  nextDoc: () => number;
+  bmIds: Map<string, string>;
+  renames: Map<string, string>;
+}
+
 export interface AppendOptions {
   /** Prepend a page break before everything this call appends. */
   startOnNewPage?: boolean;
@@ -202,6 +208,7 @@ export class MergeManager {
     const numberingMap = await this.buildNumberingMap(source, scan);
     const chartMap = await this.buildChartMap(source, srcRels, scan);
     const vmlOleMap = await this.buildVmlOleMap(source, srcRels, scan);
+    const ids = this.planIds(scan);
 
     return blocks.map((b) => {
       let xml = b.xml;
@@ -211,6 +218,7 @@ export class MergeManager {
       xml = this.applyNumIdMap(xml, numberingMap);
       xml = this.applyChartMap(xml, chartMap);
       xml = this.applyVmlOleMap(xml, vmlOleMap);
+      xml = this.applyIdPlan(xml, ids);
       xml = this.applyStyleMap(xml, styleMap);
       xml = this.stripSectionChrome(xml);
       return { kind: b.kind, tag: b.tag, xml };
@@ -386,6 +394,81 @@ export class MergeManager {
         idMap[val] ? `${a}${idMap[val]}${c}` : full,
       ),
     );
+  }
+
+  // ─── Unique ids: drawing ids + bookmarks ─────────────────────────────────────
+  //
+  // `wp:docPr/@id` and `w:bookmarkStart/@w:id` must be unique across the merged
+  // document, and a bookmark NAME must be unique too. Two split parts that both
+  // start at id 1 / `_Toc123` otherwise give Word a repair prompt (or make a
+  // cross-reference jump to the wrong part).
+
+  private planIds(blocksXml: string): IdPlan {
+    const targetXml = this.zip.readAsText("word/document.xml") ?? "";
+    const maxOf = (re: RegExp) =>
+      [...targetXml.matchAll(re)].reduce((m, x) => Math.max(m, parseInt(x[1], 10) || 0), 0);
+
+    let nextDoc = maxOf(/<wp:docPr\b[^>]*\bid="(\d+)"/g);
+    // docPr ids are unique per element, not per value: every source drawing gets
+    // its own new id, handed out in document order by applyIdPlan.
+    let nextBm = maxOf(/<w:bookmarkStart\b[^>]*\bw:id="(\d+)"/g);
+    const bmIds = new Map<string, string>();
+    const taken = new Set(
+      [...targetXml.matchAll(/<w:bookmarkStart\b[^>]*\bw:name="([^"]*)"/g)].map((m) => m[1]),
+    );
+    const srcNames = new Set(
+      [...blocksXml.matchAll(/<w:bookmarkStart\b[^>]*\bw:name="([^"]*)"/g)].map((m) => m[1]),
+    );
+    const renames = new Map<string, string>();
+    for (const m of blocksXml.matchAll(/<w:bookmark(?:Start|End)\b[^>]*\bw:id="([^"]+)"/g)) {
+      if (!bmIds.has(m[1])) bmIds.set(m[1], String(++nextBm));
+    }
+    for (const name of srcNames) {
+      if (!taken.has(name)) continue;
+      let k = 1;
+      while (taken.has(`${name}_m${k}`) || srcNames.has(`${name}_m${k}`)) k++;
+      renames.set(name, `${name}_m${k}`);
+      taken.add(`${name}_m${k}`);
+    }
+    return { nextDoc: () => ++nextDoc, bmIds, renames };
+  }
+
+  private applyIdPlan(xml: string, plan: IdPlan): string {
+    let out = xml;
+    if (out.includes("<wp:docPr")) {
+      out = out.replace(/(<wp:docPr\b[^>]*\bid=")(\d+)(")/g, (_f, a, _v, c) => `${a}${plan.nextDoc()}${c}`);
+    }
+    if (out.includes("<w:bookmark")) {
+      out = out.replace(/<w:bookmark(Start|End)\b[^>]*>/g, (tag) => {
+        let t = tag.replace(/(\bw:id=")([^"]+)(")/, (f, a, v, c) => (plan.bmIds.has(v) ? `${a}${plan.bmIds.get(v)}${c}` : f));
+        if (tag.startsWith("<w:bookmarkStart")) {
+          t = t.replace(/(\bw:name=")([^"]*)(")/, (f, a, v, c) => (plan.renames.has(v) ? `${a}${plan.renames.get(v)}${c}` : f));
+        }
+        return t;
+      });
+    }
+    if (plan.renames.size) out = this.renameBookmarkRefs(out, plan.renames);
+    return out;
+  }
+
+  /** Point REF/PAGEREF/NOTEREF/HYPERLINK \l fields and `w:anchor` at renamed bookmarks. */
+  private renameBookmarkRefs(xml: string, renames: Map<string, string>): string {
+    const fix = (instr: string) => {
+      let r = instr;
+      for (const [from, to] of renames) {
+        const f = from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        r = r
+          .replace(new RegExp(`(\\b(?:REF|PAGEREF|NOTEREF)\\s+)(")?${f}(")?(?=\\s|$)`, "g"), (_m, a, q1, q2) => `${a}${q1 ?? ""}${to}${q2 ?? ""}`)
+          .replace(new RegExp(`(\\\\l\\s+")${f}(")`, "g"), `$1${to}$2`);
+      }
+      return r;
+    };
+    return xml
+      .replace(/(<w:instrText\b[^>]*>)([^<]*)(<\/w:instrText>)/g, (_m, a, t, c) => a + fix(t) + c)
+      .replace(/(\bw:instr=")([^"]*)(")/g, (_m, a, t, c) => a + fix(t) + c)
+      .replace(/(<w:hyperlink\b[^>]*\bw:anchor=")([^"]*)(")/g, (m, a, v, c) =>
+        renames.has(v) ? `${a}${renames.get(v)}${c}` : m,
+      );
   }
 
   // ─── Charts (part-closure copy) ─────────────────────────────────────────────
