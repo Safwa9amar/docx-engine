@@ -158,6 +158,14 @@ export interface ConvertTextCaptionsOptions {
   numbering?: CaptionNumberingOptions;
   /** Force RTL/LTR; omit to follow each paragraph's own direction. */
   rtl?: boolean;
+  /**
+   * What to write between the number and the wording of EVERY converted caption
+   * (": ", " : "). Omit it and each caption keeps the punctuation its author
+   * typed, which is the right default for a tool editing one caption; a caller
+   * that rebuilds a whole thesis passes it so the list of tables does not show
+   * "Tableau 1 : …" beside "Tableau 2 - …".
+   */
+  textSeparator?: string;
   /** Report what WOULD convert without writing anything. */
   dryRun?: boolean;
 }
@@ -648,6 +656,85 @@ function stripGeneratedSeparator(region: string): string {
   );
 }
 
+// ─── A typed label word that becomes the generated label ─────────────────────
+
+/** Whitespace a student types between words; a `w:t` never holds a newline. */
+const TYPED_SPACE = "[ \\t\\u00A0\\u202F]";
+const rxEscape = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * A paragraph's first run up to and including its first `<w:t>`:
+ * 1 open tag  2 run properties (+ a rendering hint)  3 the `w:t` attributes  4 its raw text.
+ * A run whose properties carry a revision record (`w:rPrChange`) never matches: its
+ * `<w:rPr>` nests another, and cutting at the first close would split the revision.
+ */
+const FIRST_RUN_RE =
+  /^(<w:r(?:\s[^>]*[^/>])?>)((?:<w:rPr\s*\/>|<w:rPr(?:\s[^>]*)?>(?:(?!<w:rPrChange)[\s\S])*?<\/w:rPr>)?(?:<w:lastRenderedPageBreak\s*\/>)?)<w:t((?:\s[^>]*)?)>([^<]*)<\/w:t>/;
+
+/**
+ * Cut a typed label WORD ("جدول") off the front of a paragraph, together with the
+ * whitespace after it, so that a generated label can take its place instead of
+ * repeating it ("جدول 1: جدول الميزانية" -> "جدول 1: الميزانية").
+ *
+ * Run-level surgery on the paragraph's FIRST text run and nothing else. It cuts only
+ * when the word sits wholly at the start of that run's first `<w:t>`, is a whole word
+ * (whitespace or the end of the run after it), and more wording follows. Otherwise —
+ * the word split across runs, a different word that merely starts with it, a tab or
+ * a field or a hyperlink or a revision in front, the word standing alone — it returns
+ * the paragraph untouched with `dropped: false`. Every other run, bookmark and field
+ * is copied through byte for byte. A run that held nothing but the word disappears;
+ * a tatweel inside the word ("جـدول") does not stop it matching.
+ *
+ * Pure, so that a caller can ask what {@link CaptionManager.addGeneratedCaption} would
+ * do with `dropLeadingWord` without touching a document.
+ */
+export function removeLeadingWord(paragraphXml: string, word: string): { xml: string; dropped: boolean } {
+  const unchanged = { xml: paragraphXml, dropped: false };
+  const words = word.trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return unchanged;
+
+  const shell = /^(\s*<w:p(?:\s[^>]*[^/>])?>)([\s\S]*?)(<\/w:p>\s*)$/.exec(paragraphXml);
+  if (!shell) return unchanged; // not a paragraph, or an empty `<w:p/>`
+  const [, open, inner, close] = shell;
+  const pPr = paragraphPropsXml(paragraphXml);
+  if (/<w:pPrChange\b/.test(pPr)) return unchanged;
+  const prefix = pPr ? inner.slice(0, inner.indexOf(pPr) + pPr.length) : "";
+  const rest = inner.slice(prefix.length);
+
+  // Only markers that carry no text may stand in front of the first run.
+  const lead = /^(?:\s*<w:(?:bookmarkStart|bookmarkEnd|proofErr)\b[^>]*\/>)*\s*/.exec(rest)![0];
+  const run = FIRST_RUN_RE.exec(rest.slice(lead.length));
+  if (!run) return unchanged;
+  const [head, runProps, tAttrs, rawText] = [run[1], run[2], run[3], run[4]];
+
+  const wordPattern = words
+    .map((w) => Array.from(w).map((ch) => rxEscape(escapeXmlContent(ch))).join("\\u0640*"))
+    .join(`${TYPED_SPACE}+`);
+  const matched = new RegExp(`^${TYPED_SPACE}*${wordPattern}`).exec(rawText);
+  if (!matched) return unchanged;
+  const afterWord = rawText.slice(matched[0].length);
+  const spaces = new RegExp(`^${TYPED_SPACE}*`).exec(afterWord)![0];
+  if (afterWord !== "" && spaces === "") return unchanged; // glued to a longer word
+  const tail = afterWord.slice(spaces.length); // what stays of this run's text
+
+  const afterText = lead.length + run[0].length; // `rest` offset just past </w:t>
+  const runEnd = rest.indexOf("</w:r>", afterText);
+  if (runEnd < 0) return unchanged;
+  const runTail = rest.slice(afterText, runEnd); // the run's content after that w:t
+  if (/<w:r[\s>/]/.test(runTail)) return unchanged; // a run nested in this one (an object, alternate content)
+  const after = rest.slice(runEnd + "</w:r>".length);
+
+  const following = paragraphText(runTail + after);
+  if (tail === "" && spaces === "" && !/^[\s\u00A0\u202F]/.test(following)) return unchanged; // the word runs on in the next run
+  if (tail.trim() === "" && following.trim() === "") return unchanged; // the word stands alone
+
+  const newRun =
+    tail !== "" ? `${head}${runProps}<w:t${tAttrs}>${tail}</w:t>${runTail}</w:r>`
+    : runTail.trim() === "" ? ""
+    : `${head}${runProps}${runTail}</w:r>`;
+  return { xml: `${open}${prefix}${lead}${newRun}${after}${close}`, dropped: true };
+}
+
 /**
  * Read EVERY caption in one paragraph's XML — Word numbers each SEQ field it
  * finds, and real theses do put two figures on one line ("Figure 19: … Figure
@@ -1076,8 +1163,9 @@ export class CaptionManager {
           text: hit.match.text,
           numbering: opts.numbering,
           rtl,
-          // Keep the student's own punctuation: " : " in French, "- ", ". ".
-          textSeparator: hit.match.separator.replace(/[\s ]+/g, " ") || " ",
+          // Keep the student's own punctuation (" : " in French, "- ", ". ") unless the
+          // caller asked for one separator everywhere.
+          textSeparator: opts.textSeparator ?? (hit.match.separator.replace(/[\s ]+/g, " ") || " "),
         },
         1, // placeholder — renumberBlocks below writes every true number
         1,
@@ -1126,8 +1214,20 @@ export class CaptionManager {
    */
   public async addGeneratedCaption(
     blockIndex: number,
-    opts: { kind: CaptionKind; label?: string; rtl?: boolean; textSeparator?: string; numbering?: CaptionNumberingOptions },
-  ): Promise<{ ok: true; label: string; number: string } | { ok: false; reason: GeneratedCaptionRefusal }> {
+    opts: {
+      kind: CaptionKind; label?: string; rtl?: boolean; textSeparator?: string; numbering?: CaptionNumberingOptions;
+      /**
+       * The label WORD the student may have typed in front of their wording ("جدول"
+       * in "جدول الميزانية"). When the paragraph starts with exactly that word, as a
+       * whole word wholly inside its first text run, the word and the whitespace after
+       * it are cut and the generated label takes its place: "جدول 1: الميزانية", not
+       * "جدول 1: جدول الميزانية". When it cannot be cut cleanly (split across runs, not
+       * at the start, standing alone, behind a field or a hyperlink) nothing is touched
+       * and `droppedWord` is false. Only that first run changes; see {@link removeLeadingWord}.
+       */
+      dropLeadingWord?: string;
+    },
+  ): Promise<{ ok: true; label: string; number: string; droppedWord: boolean } | { ok: false; reason: GeneratedCaptionRefusal }> {
     const blocks = await this.doc.getBlocks();
     const block  = blocks[blockIndex];
     if (!block) return { ok: false, reason: "no-such-block" };
@@ -1148,23 +1248,29 @@ export class CaptionManager {
     const sepBm = ids();
     // Label + number only (no text), exactly as captionContent builds them.
     const prefix = this.captionContent({ label, numbering: opts.numbering, rtl }, 1, 1, bm, rPr);
-    const sep    = opts.textSeparator ?? ": ";
+
+    // The student's own label word, when asked for, is the one thing cut: the runs below come from `source`.
+    const cut = opts.dropLeadingWord ? removeLeadingWord(xml, opts.dropLeadingWord) : null;
+    const source = cut?.dropped ? cut.xml : xml;
+    const shell = paragraphShell(source);
+    const inner = source.slice(shell.head.length, source.endsWith("</w:p>") ? source.length - "</w:p>".length : source.length);
+    const pPr   = paragraphPropsXml(source);
+    const rest  = pPr ? inner.slice(inner.indexOf(pPr) + pPr.length) : inner;
+
+    let sep = opts.textSeparator ?? ": ";
+    // The space the word left in the next run is the separator's own: do not write it twice.
+    if (cut?.dropped && /^[\s\u00A0\u202F]/.test(paragraphText(rest))) sep = sep.replace(/[\s\u00A0\u202F]+$/, "");
     const sepRun =
       `<w:bookmarkStart w:id="${sepBm.id}" w:name="${SEP_BOOKMARK}${sepBm.id}"/>` +
       `<w:r>${rPr}<w:t xml:space="preserve">${escapeXmlContent(sep)}</w:t></w:r>` +
       `<w:bookmarkEnd w:id="${sepBm.id}"/>`;
-
-    const shell = paragraphShell(xml);
-    const inner = xml.slice(shell.head.length, xml.endsWith("</w:p>") ? xml.length - "</w:p>".length : xml.length);
-    const pPr   = paragraphPropsXml(xml);
-    const rest  = pPr ? inner.slice(inner.indexOf(pPr) + pPr.length) : inner;
     block.xml = `${shell.head}${captionPPr(xml)}${prefix}${sepRun}${rest}${shell.tail}`;
 
     this.renumberBlocks(blocks);
     await this.doc.saveBlocks(blocks);
 
     const entry = parseCaptionParagraph(blocks[blockIndex].xml, blockIndex)[0];
-    return { ok: true, label, number: entry?.number ?? "" };
+    return { ok: true, label, number: entry?.number ?? "", droppedWord: cut?.dropped === true };
   }
 
   /**

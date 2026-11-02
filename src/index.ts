@@ -389,7 +389,7 @@ export type {
   TextCaptionMatch,
   GeneratedCaptionRefusal,
 } from "./core/PartsManagers/CaptionManager";
-export { seqIdentifier, formatSeqNumber, parseCaptionParagraph, parseTextCaption } from "./core/PartsManagers/CaptionManager";
+export { seqIdentifier, formatSeqNumber, parseCaptionParagraph, parseTextCaption, removeLeadingWord } from "./core/PartsManagers/CaptionManager";
 export type { CommentEntry } from "./core/PartsManagers/CommentsManager";
 export type { RevisionEntry, RevisionType } from "./core/PartsManagers/TrackedChangesManager";
 export type {
