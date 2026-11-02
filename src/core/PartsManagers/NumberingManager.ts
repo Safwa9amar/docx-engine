@@ -1,9 +1,13 @@
 import { wordRootAttributes } from "@/utils/rootNamespaces";
 import * as XmlUtils from "@/utils/xmlUtils";
 import Paragraph from "@/core/files/paragraph/index";
+import { RelManager } from "@/core/PartsManagers/RelManager";
+import { ContentTypesManager } from "./ContentTypesManager";
 import AdmZip from "adm-zip";
 
 const NUMBERING_PATH = "word/numbering.xml";
+const NUMBERING_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering";
+const NUMBERING_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml";
 
 export interface NumberingDefinition {
   abstractNumId: string;
@@ -32,12 +36,20 @@ export class NumberingManager {
   }
 
   private async writeNumbering(obj: any): Promise<void> {
+    const isNew = !this.zip.getEntry(NUMBERING_PATH);
     const xml = XmlUtils.buildXml(obj["w:numbering"], {
       rootName: "w:numbering",
       headless: false,
       pretty: true,
     });
     this.zip.addFile(NUMBERING_PATH, Buffer.from(xml, "utf-8"));
+    // A part with no relationship and no content type is one Word never reads:
+    // every list pointing into it would lose its bullet or number.
+    if (isNew) {
+      const rels = new RelManager(this.zip);
+      await new ContentTypesManager(this.zip).addOverride(`/${NUMBERING_PATH}`, NUMBERING_CONTENT_TYPE);
+      await rels.addRelationship(await rels.genId(), NUMBERING_REL_TYPE, "numbering.xml");
+    }
   }
 
   /**
