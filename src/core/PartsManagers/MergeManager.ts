@@ -967,9 +967,15 @@ export class MergeManager {
       }
       return this.applyAttrMap(xml, ["r:embed", "r:link", "r:id", "r:pict", "r:href", "o:relid"], Object.fromEntries(ids));
     };
-    return kind === "footnote"
+    const map = await (kind === "footnote"
       ? this.footnotes.copyFootnotesVerbatim(sourceNotesXml, refIds, rewrite)
-      : this.endnotes.copyEndnotesVerbatim(sourceNotesXml, refIds, rewrite);
+      : this.endnotes.copyEndnotesVerbatim(sourceNotesXml, refIds, rewrite));
+    // The source had them all (neededNotesXml), so a shortfall means this document's
+    // notes part cannot take them, and the references would be left dangling.
+    if ([...refIds].some((id) => !map[id])) {
+      throw new Error(`merge: ${notesPart} in this document cannot take the copied ${kind}s`);
+    }
+    return map;
   }
 
   // ─── Numbering (Phase 2) ─────────────────────────────────────────────────────

@@ -224,6 +224,14 @@ describe("merge: endnotes survive the way footnotes do", () => {
   });
 });
 
+describe("merge: a notes part that cannot take the notes", () => {
+  test.each(["footnote", "endnote"] as const)("a %s part with a self-closed root refuses, rather than leave the reference dangling", async (kind) => {
+    const t = await doc([text("target")], { [`${kind}s`]: {} });
+    t.zip.addFile(`word/${kind}s.xml`, Buffer.from(`<w:${kind}s xmlns:w="${W_NS}"/>`, "utf8"));
+    await expect(t.merge.appendDocument(await buf([refPara(kind, 1)], { [`${kind}s`]: { 1: noteBody("a") } }))).rejects.toThrow(`cannot take the copied ${kind}s`);
+  });
+});
+
 describe("merge: a note's own styles and lists travel with it", () => {
   const style = (id: string, extra = "", attrs = 'w:type="paragraph"') => `<w:style ${attrs} w:styleId="${id}"><w:name w:val="${id}"/>${extra}</w:style>`;
   const styleIds = (xml: string) => [...xml.matchAll(/<w:style\b[^>]*\bw:styleId="([^"]+)"/g)].map((m) => m[1]);
