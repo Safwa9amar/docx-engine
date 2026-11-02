@@ -14,6 +14,9 @@ const CONTENT_TYPE_MAP: Record<string, string> = {
   bmp: "image/bmp",
   tiff: "image/tiff",
   svg: "image/svg+xml",
+  tif: "image/tiff",
+  wmf: "image/x-wmf",
+  emf: "image/x-emf",
 };
 
 export interface ImageEntry {
@@ -182,6 +185,22 @@ export class MediaManager {
   }
 
   /**
+   * Next free `imageN` number, counted over EVERY file in word/media. `listImages`
+   * only sees raster/svg extensions, so counting through it ignored `.wmf`/`.emf`
+   * (and `.tif`): with only those present — or a mix — the counter did not advance
+   * and each new image overwrote the last one.
+   */
+  private nextImageNumber(): number {
+    let max = 0;
+    for (const entry of this.zip.getEntries()) {
+      if (!entry.entryName.startsWith(`${MEDIA_DIR}/`)) continue;
+      const m = /(?:^|\/)image(\d+)\./i.exec(entry.entryName);
+      if (m) max = Math.max(max, parseInt(m[1], 10));
+    }
+    return max + 1;
+  }
+
+  /**
    * Inserts a new image into the document.
    * @param imageBuffer  Raw image bytes.
    * @param extension    File extension without dot (e.g. "png", "jpg").
@@ -192,12 +211,7 @@ export class MediaManager {
     extension: string,
   ): Promise<{ imagePath: string; relId: string }> {
     const ext = extension.toLowerCase();
-    const existingImages = this.listImages();
-    const nums = existingImages.map((img) => {
-      const m = img.name.match(/image(\d+)\./);
-      return m ? parseInt(m[1], 10) : 0;
-    });
-    const next = nums.length ? Math.max(...nums) + 1 : 1;
+    const next = this.nextImageNumber();
     const imageName = `image${next}.${ext}`;
     const imagePath = `${MEDIA_DIR}/${imageName}`;
 
@@ -227,12 +241,7 @@ export class MediaManager {
     extension: string,
   ): Promise<{ imagePath: string }> {
     const ext = extension.toLowerCase();
-    const existingImages = this.listImages();
-    const nums = existingImages.map((img) => {
-      const m = img.name.match(/image(\d+)\./);
-      return m ? parseInt(m[1], 10) : 0;
-    });
-    const next = nums.length ? Math.max(...nums) + 1 : 1;
+    const next = this.nextImageNumber();
     const imagePath = `${MEDIA_DIR}/image${next}.${ext}`;
     this.zip.addFile(imagePath, imageBuffer);
     const contentType = CONTENT_TYPE_MAP[ext] ?? `image/${ext}`;

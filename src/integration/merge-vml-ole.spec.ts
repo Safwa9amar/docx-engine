@@ -348,4 +348,79 @@ describe("MergeManager — VML pictures and OLE objects survive a merge", () => 
       expect(rels).not.toContain("&amp;amp;");
     });
   });
+
+  describe("every copied image gets its own part", () => {
+    /** Source with N OLE objects whose previews are `ext` files, plus 2 png VML pictures. */
+    async function previews(ext: string, n: number, base: number): Promise<Buffer> {
+      const e = await Mdocxengine.loadFromFile("samples/example.docx");
+      const ct = new ContentTypesManager(e.zip);
+      await ct.addDefault("png", "image/png");
+      await ct.addDefault(ext, `image/x-${ext}`);
+      await ct.addDefault("bin", "application/vnd.openxmlformats-officedocument.oleObject");
+      const blocks: BodyBlock[] = [];
+      for (let i = 0; i < n; i++) {
+        await e.merge["rels"].addRelationship(`rIdP${i}`, IMG, `media/prev${i}.${ext}`);
+        await e.merge["rels"].addRelationship(`rIdO${i}`, OLE, `embeddings/oleObject${i}.bin`);
+        e.zip.addFile(`word/media/prev${i}.${ext}`, Buffer.from([base, i, 1, 2, 3]));
+        e.zip.addFile(`word/embeddings/oleObject${i}.bin`, Buffer.from([base + 100, i]));
+        blocks.push({ kind: "paragraph", tag: "w:p", xml: oleParaX(`rIdP${i}`, `rIdO${i}`) });
+      }
+      for (let i = 0; i < 2; i++) {
+        await e.merge["rels"].addRelationship(`rIdN${i}`, IMG, `media/pic${i}.png`);
+        e.zip.addFile(`word/media/pic${i}.png`, Buffer.from([base, 50 + i, 9]));
+        blocks.push({ kind: "paragraph", tag: "w:p", xml: vmlPara(`rIdN${i}`) });
+      }
+      await e.document.saveBlocks(blocks);
+      return e.zip.toBuffer();
+    }
+
+    for (const ext of ["wmf", "emf", "tif", "gif"]) {
+      test(`3 distinct .${ext} previews + 2 png pictures stay 5 distinct parts`, async () => {
+        const t = await target();
+        await t.merge.appendDocument(await previews(ext, 3, 7), {});
+        const { pics } = await resolved(t);
+        expect(pics.map((p) => [...p.bytes])).toEqual([
+          [7, 0, 1, 2, 3], [7, 1, 1, 2, 3], [7, 2, 1, 2, 3], [7, 50, 9], [7, 51, 9],
+        ]);
+        expect(new Set(pics.map((p) => p.target)).size).toBe(5);
+        expect(t.zip.readAsText("[Content_Types].xml")).toContain(`Extension="${ext}"`);
+      });
+    }
+
+    test("a target that already holds media/image1.wmf keeps it", async () => {
+      const t = await target();
+      t.zip.addFile("word/media/image1.wmf", Buffer.from("EXISTING"));
+      await t.merge.appendDocument(await previews("wmf", 3, 7), {});
+      const { pics } = await resolved(t);
+      expect(new Set(pics.map((p) => p.target)).size).toBe(5);
+      expect(pics[0].bytes[0]).toBe(7);
+      expect(t.zip.getEntry("word/media/image1.wmf")!.getData().toString()).toBe("EXISTING");
+    });
+
+    test("DrawingML images with wmf/emf/tif extensions do not collapse either", async () => {
+      const e = await Mdocxengine.loadFromFile("samples/example.docx");
+      const exts = ["wmf", "emf", "tif", "wmf"];
+      const blocks: BodyBlock[] = [];
+      for (let i = 0; i < exts.length; i++) {
+        await e.merge["rels"].addRelationship(`rIdD${i}`, IMG, `media/d${i}.${exts[i]}`);
+        e.zip.addFile(`word/media/d${i}.${exts[i]}`, Buffer.from([1, i]));
+        blocks.push({
+          kind: "paragraph",
+          tag: "w:p",
+          xml: `<w:p><w:r><w:drawing><a:blip xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="rIdD${i}"/></w:drawing></w:r></w:p>`,
+        });
+      }
+      await e.document.saveBlocks(blocks);
+      const t = await target();
+      await t.merge.appendDocument(e.zip.toBuffer(), {});
+      const body = await bodyXml(t);
+      const rels = relsOf(t);
+      const got = [...body.matchAll(/r:embed="([^"]+)"/g)].map((m) => {
+        const r = rels.find((x) => x.id === m[1])!;
+        return [r.target, [...t.zip.getEntry(`word/${r.target}`)!.getData()]] as const;
+      });
+      expect(got.map((g) => g[1])).toEqual([[1, 0], [1, 1], [1, 2], [1, 3]]);
+      expect(new Set(got.map((g) => g[0])).size).toBe(4);
+    });
+  });
 });
