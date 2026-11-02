@@ -33,6 +33,7 @@ import { NumberingManager } from "./NumberingManager";
 import { RelManager } from "./RelManager";
 import { ContentTypesManager } from "./ContentTypesManager";
 import { parseXml } from "@/utils/xmlUtils";
+import { carryRootNamespaces } from "@/utils/rootNamespaces";
 import type { BodyBlock } from "@/core/files/body/OrderedBody";
 // Imported lazily inside appendDocument() to avoid an index.ts ↔ MergeManager cycle.
 import type { Mdocxengine as MdocxengineType } from "@/index";
@@ -158,6 +159,28 @@ export class MergeManager {
     if (opts.leadingBlocks?.length) prefix.push(...opts.leadingBlocks);
 
     await this.document.saveBlocks([...existing, ...prefix, ...remapped]);
+    this.carryNamespaces(source);
+  }
+
+  /**
+   * The copied blocks/footnotes/numbering use prefixes (`w14`, `mc`, `wps`, `r`…)
+   * the SOURCE root declared. Bind them on the matching TARGET root, or the part
+   * has unbound prefixes and Word refuses to open it. A prefix bound to a
+   * different URI is a real conflict: throw rather than silently mis-bind.
+   */
+  private carryNamespaces(source: MdocxengineType): void {
+    for (const part of ["word/document.xml", "word/footnotes.xml", "word/endnotes.xml", "word/numbering.xml"]) {
+      const targetXml = this.zip.readAsText(part);
+      const sourceXml = source.zip.readAsText(part);
+      if (!targetXml || !sourceXml) continue;
+      const { xml, conflicts } = carryRootNamespaces(targetXml, sourceXml);
+      if (conflicts.length) {
+        throw new Error(
+          `merge: ${part} binds prefix(es) ${conflicts.join(", ")} to a different namespace in the source than in the target`,
+        );
+      }
+      if (xml !== targetXml) this.zip.addFile(part, Buffer.from(xml, "utf8"));
+    }
   }
 
   // ─── Remap orchestration ───────────────────────────────────────────────────

@@ -1,3 +1,4 @@
+import { wordRootAttributes } from "@/utils/rootNamespaces";
 import * as XmlUtils from "@/utils/xmlUtils";
 import Paragraph from "@/core/files/paragraph/index";
 import AdmZip from "adm-zip";
@@ -135,7 +136,7 @@ export class NumberingManager {
     const obj = await this.readNumbering();
     if (!obj["w:numbering"]) obj["w:numbering"] = {};
     const root = obj["w:numbering"];
-    if (!root.$) root.$ = { "xmlns:w": W_MAIN_NS };
+    if (!root.$) root.$ = { ...wordRootAttributes(), "xmlns:w": W_MAIN_NS };
     const ensureArr = (k: string) => {
       root[k] = Array.isArray(root[k]) ? root[k] : root[k] ? [root[k]] : [];
     };

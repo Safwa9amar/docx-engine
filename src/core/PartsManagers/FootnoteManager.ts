@@ -3,6 +3,7 @@ import { RelManager } from "@/core/PartsManagers/RelManager";
 import { ContentTypesManager } from "./ContentTypesManager";
 import { Run as RunInterface } from "@/core/files/paragraph/types";
 import AdmZip from "adm-zip";
+import { wordRootAttributes } from "@/utils/rootNamespaces";
 
 const FOOTNOTES_PATH = "word/footnotes.xml";
 const FOOTNOTE_REL_TYPE =
@@ -47,9 +48,9 @@ export class FootnoteManager {
   private emptyFootnotesDoc(): any {
     return {
       "w:footnotes": {
-        $: {
-          "xmlns:w": FOOTNOTE_NS,
-        },
+        // The standard Word set: footnotes copied from a modern source carry
+        // r:id, w14:paraId, mc:AlternateContent… all of which need a binding.
+        $: { ...wordRootAttributes(), "xmlns:w": FOOTNOTE_NS },
         "w:footnote": [
           // Required separator footnotes that Word expects
           {
