@@ -442,6 +442,14 @@ export {
   type ParagraphRunStyleResult,
 } from "./core/ooxml/paragraphProps";
 export { CT_PPR_ORDER, canonicalizeParagraphProps } from "./core/ooxml/canonicalOrder";
+// Byte-safe presentation wipe for ONE body block (rescue regenerates formatting).
+export {
+  wipeBlockPresentation,
+  KEPT_RUN_PROPS,
+  REMOVED_PARA_PROPS,
+  type WipeOptions,
+  type WipeResult,
+} from "./core/ooxml/presentation";
 // Picture PLACEMENT: where a <w:drawing> sits on the page. Vertical position is
 // not a property but a CONTAINER — an in-flow `wp:inline` picture has to become
 // a floating `wp:anchor` before "centre it on the page" can even be expressed.
