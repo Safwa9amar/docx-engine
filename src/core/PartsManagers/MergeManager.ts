@@ -178,6 +178,7 @@ export class MergeManager {
     const footnoteMap = await this.buildFootnoteMap(source, scan);
     const numberingMap = await this.buildNumberingMap(source, scan);
     const chartMap = await this.buildChartMap(source, srcRels, scan);
+    const vmlOleMap = await this.buildVmlOleMap(source, srcRels, scan);
 
     return blocks.map((b) => {
       let xml = b.xml;
@@ -186,6 +187,7 @@ export class MergeManager {
       xml = this.applyFootnoteRefMap(xml, footnoteMap);
       xml = this.applyNumIdMap(xml, numberingMap);
       xml = this.applyChartMap(xml, chartMap);
+      xml = this.applyVmlOleMap(xml, vmlOleMap);
       xml = this.applyStyleMap(xml, styleMap);
       xml = this.stripSectionChrome(xml);
       return { kind: b.kind, tag: b.tag, xml };
@@ -285,6 +287,82 @@ export class MergeManager {
       map[rId] = newId;
     }
     return map;
+  }
+
+  // ─── VML pictures + OLE objects ─────────────────────────────────────────────
+  //
+  // `<v:imagedata r:id>` (a VML picture, or the preview of an OLE object) and
+  // `<o:OLEObject r:id>` (the embedded object) address parts by relationship id,
+  // just like `r:embed`. Unlike a chart, losing one silently is not acceptable —
+  // a missing equation object is lost thesis content — so an unresolvable
+  // reference THROWS rather than being dropped.
+
+  /** Attributes on `<v:imagedata>` that name a relationship. */
+  private static readonly VML_REL_ATTRS = ["r:id", "r:href", "o:relid"];
+
+  /** Copy each VML image and OLE object referenced by the blocks; return
+   *  source-rId → new-rId. */
+  private async buildVmlOleMap(
+    source: MdocxengineType,
+    srcRels: Record<string, { type: string; target: string; targetMode?: string }>,
+    blocksXml: string,
+  ): Promise<Record<string, string>> {
+    const refs: { tag: string; attr: string; rId: string; ole: boolean }[] = [];
+    for (const m of blocksXml.matchAll(/<(v:imagedata|o:OLEObject)\b[^>]*>/g)) {
+      const ole = m[1] === "o:OLEObject";
+      for (const attr of ole ? ["r:id"] : MergeManager.VML_REL_ATTRS) {
+        const v = new RegExp(`\\b${attr}="([^"]+)"`).exec(m[0])?.[1];
+        if (v) refs.push({ tag: m[1], attr, rId: v, ole });
+      }
+    }
+    if (refs.length === 0) return {};
+
+    const srcOverrides = await this.readContentTypeOverrides(source.zip);
+    const srcDefaults = await this.readContentTypeDefaults(source.zip);
+    const copied = new Map<string, string>();
+    const map: Record<string, string> = {};
+
+    for (const { tag, attr, rId, ole } of refs) {
+      if (map[rId]) continue;
+      const rel = srcRels[rId];
+      if (!rel) {
+        throw new Error(`merge: <${tag} ${attr}="${rId}"> has no relationship in the source document`);
+      }
+      if (rel.targetMode === "External") {
+        const newId = await this.rels.genId();
+        await this.rels.addRelationship(newId, rel.type, rel.target, "External");
+        map[rId] = newId;
+        continue;
+      }
+      const srcPath = resolvePartPath("word/document.xml", rel.target);
+      const entry = source.zip.getEntry(srcPath);
+      if (!entry) {
+        throw new Error(
+          `merge: <${tag} ${attr}="${rId}"> points at ${srcPath}, which is missing from the source package`,
+        );
+      }
+      if (ole) {
+        const newPath = await this.copyPartClosure(source, srcPath, srcOverrides, srcDefaults, copied);
+        const newId = await this.rels.genId();
+        await this.rels.addRelationship(newId, rel.type, newPath.replace(/^word\//, ""));
+        map[rId] = newId;
+      } else {
+        const ext = (/\.([a-zA-Z0-9]+)$/.exec(srcPath)?.[1] ?? "png").toLowerCase();
+        map[rId] = (await this.media.insertImage(entry.getData(), ext)).relId;
+      }
+    }
+    return map;
+  }
+
+  /** Remap the relationship attributes inside `<v:imagedata>` / `<o:OLEObject>`
+   *  open tags only (never another element's r:id). */
+  private applyVmlOleMap(xml: string, idMap: Record<string, string>): string {
+    if (Object.keys(idMap).length === 0) return xml;
+    return xml.replace(/<(?:v:imagedata|o:OLEObject)\b[^>]*>/g, (tag) =>
+      tag.replace(/\b((?:r:id|r:href|o:relid)=")([^"]+)(")/g, (full, a, val, c) =>
+        idMap[val] ? `${a}${idMap[val]}${c}` : full,
+      ),
+    );
   }
 
   // ─── Charts (part-closure copy) ─────────────────────────────────────────────
@@ -471,7 +549,29 @@ export class MergeManager {
     );
     if (refIds.size === 0) return {};
     const sourceFootnotesXml = source.zip.readAsText("word/footnotes.xml");
-    return this.footnotes.copyFootnotesVerbatim(sourceFootnotesXml, refIds);
+    // A footnote's `r:embed` resolves against word/_rels/footnotes.xml.rels, not
+    // the document rels — so its images are copied into THAT part's rels.
+    const srcRelsXml = source.zip.readAsText("word/_rels/footnotes.xml.rels");
+    const fnRels: Record<string, string> = {};
+    for (const m of srcRelsXml.matchAll(/<Relationship\b[^>]*>/g)) {
+      const id = /\bId="([^"]+)"/.exec(m[0])?.[1];
+      const target = /\bTarget="([^"]+)"/.exec(m[0])?.[1];
+      if (id && target && !/TargetMode="External"/.test(m[0])) fnRels[id] = target;
+    }
+    const rewrite = async (xml: string): Promise<string> => {
+      const ids = new Map<string, string>();
+      for (const m of xml.matchAll(/\br:embed="([^"]+)"/g)) {
+        const target = fnRels[m[1]];
+        const bytes = target && source.zip.getEntry(resolvePartPath("word/footnotes.xml", target));
+        if (!bytes) continue;
+        const ext = (/\.([a-zA-Z0-9]+)$/.exec(target)?.[1] ?? "png").toLowerCase();
+        if (!ids.has(m[1])) {
+          ids.set(m[1], await this.media.addImageToPartRels("word/footnotes.xml", bytes.getData(), ext));
+        }
+      }
+      return this.applyAttrMap(xml, ["r:embed"], Object.fromEntries(ids));
+    };
+    return this.footnotes.copyFootnotesVerbatim(sourceFootnotesXml, refIds, rewrite);
   }
 
   // ─── Numbering (Phase 2) ─────────────────────────────────────────────────────

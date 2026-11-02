@@ -166,6 +166,7 @@ export class FootnoteManager {
   public async copyFootnotesVerbatim(
     sourceFootnotesXml: string | null,
     neededIds: Set<string>,
+    rewrite?: (footnoteXml: string) => Promise<string>,
   ): Promise<Record<string, string>> {
     if (!sourceFootnotesXml || neededIds.size === 0) return {};
 
@@ -198,9 +199,10 @@ export class FootnoteManager {
     const injected: string[] = [];
     for (const el of elements) {
       const newId = String(nextId++);
-      const gt = el.xml.indexOf(">");
-      const open = el.xml.slice(0, gt).replace(/\bw:id="[^"]+"/, `w:id="${newId}"`);
-      injected.push(open + el.xml.slice(gt));
+      const xml = rewrite ? await rewrite(el.xml) : el.xml;
+      const gt = xml.indexOf(">");
+      const open = xml.slice(0, gt).replace(/\bw:id="[^"]+"/, `w:id="${newId}"`);
+      injected.push(open + xml.slice(gt));
       idMap[el.id] = newId;
     }
 
