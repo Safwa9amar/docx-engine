@@ -67,8 +67,8 @@ export class FontTableManager {
   /** Names of fonts that carry at least one embedded variant. */
   embeddedFonts(): string[] {
     const xml = this.read(FONT_TABLE);
-    return [...xml.matchAll(/<w:font\b[^>]*\bw:name="([^"]*)"[^>]*>([\s\S]*?)<\/w:font>/g)]
-      .filter((m) => /<w:embed(Regular|Bold|Italic|BoldItalic)\b/.test(m[2]))
+    return [...xml.matchAll(/<w:font\b[^>]*?\bw:name="([^"]*)"[^>]*?(?:\/>|>([\s\S]*?)<\/w:font>)/g)]
+      .filter((m) => m[2] !== undefined && /<w:embed(Regular|Bold|Italic|BoldItalic)\b/.test(m[2]))
       .map((m) => unescAttr(m[1]));
   }
 
@@ -78,87 +78,106 @@ export class FontTableManager {
       const p = embeddingPermission(readFsType(input[v] as Buffer));
       if (!canEmbed(p)) return { name: input.name, embedded: false, reason: p, variants: [], settingsUpdated: false };
     }
-    await this.ensureFontTable();
+
+    // Resolve everything in memory first; nothing is written until all of it is known.
+    const hadTable = !!this.zip.getEntry(FONT_TABLE);
+    let table = hadTable
+      ? this.read(FONT_TABLE)
+      : `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:fonts xmlns:w="${W_NS}" xmlns:r="${R_NS}"></w:fonts>`;
+    if (!/<w:fonts\b[^>]*\bxmlns:r=/.test(table)) {
+      table = table.replace(/<w:fonts\b/, () => `<w:fonts xmlns:r="${R_NS}"`);
+    }
+    let rels = this.read(FONT_TABLE_RELS) || `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="${RELS_NS}"></Relationships>`;
+
+    const { next: tableWithoutOld, oldIds } = stripOldEmbeds(table, input.name);
+    const orphanParts: string[] = [];
+    for (const id of oldIds) {
+      const rel = rels.match(new RegExp(`<Relationship\\b[^>]*\\bId="${escRe(id)}"[^>]*?/>`));
+      if (!rel) continue;
+      const target = rel[0].match(/\bTarget="([^"]*)"/);
+      if (target) orphanParts.push(`word/${target[1]}`);
+      rels = rels.replace(rel[0], () => "");
+    }
+
+    const taken = new Set<string>();
+    const parts: Array<{ path: string; bytes: Buffer }> = [];
     const embeds: string[] = [];
     for (const v of present) {
       const key = this.newKey();
-      const target = this.addFontPart(obfuscateFont(input[v] as Buffer, key));
-      const relId = this.addFontRel(target);
-      embeds.push(`<w:${EMBED_TAG[v]} r:id="${relId}" w:fontKey="${key}"/>`);
+      let k = 1;
+      while ((this.zip.getEntry(`word/fonts/font${k}.odttf`) && !orphanParts.includes(`word/fonts/font${k}.odttf`)) || taken.has(`font${k}`)) k++;
+      taken.add(`font${k}`);
+      const target = `fonts/font${k}.odttf`;
+      parts.push({ path: `word/${target}`, bytes: obfuscateFont(input[v] as Buffer, key) });
+      const added = appendRel(rels, FONT_REL, target);
+      rels = added.xml;
+      embeds.push(`<w:${EMBED_TAG[v]} r:id="${added.id}" w:fontKey="${key}"/>`);
+    }
+    table = insertFontEntry(tableWithoutOld, input.name, embeds.join(""));
+    const settings = this.resolveSettings();
+
+    // Writes.
+    for (const path of orphanParts) {
+      if (!parts.some((x) => x.path === path)) this.zip.deleteFile(path);
+    }
+    for (const part of parts) this.zip.addFile(part.path, part.bytes);
+    this.zip.addFile(FONT_TABLE_RELS, Buffer.from(rels, "utf-8"));
+    this.zip.addFile(FONT_TABLE, Buffer.from(table, "utf-8"));
+    if (!hadTable) {
+      await this.contentTypes.addOverride(`/${FONT_TABLE}`, FONT_TABLE_CT);
+      const docRels = this.read(DOC_RELS);
+      if (!/Target="fontTable\.xml"/.test(docRels)) {
+        this.zip.addFile(DOC_RELS, Buffer.from(appendRel(docRels, FONT_TABLE_REL, "fontTable.xml").xml, "utf-8"));
+      }
     }
     await this.contentTypes.addDefault("odttf", ODTTF_CT);
-    this.writeFontEntry(input.name, embeds.join(""));
-    const settingsUpdated = this.ensureEmbedSetting();
-    return { name: input.name, embedded: true, variants: present, settingsUpdated };
+    if (settings.xml !== null) this.zip.addFile(SETTINGS, Buffer.from(settings.xml, "utf-8"));
+    return { name: input.name, embedded: true, variants: present, settingsUpdated: settings.ok };
   }
 
-  private async ensureFontTable(): Promise<void> {
-    if (!this.zip.getEntry(FONT_TABLE)) {
-      this.zip.addFile(FONT_TABLE, Buffer.from(
-        `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:fonts xmlns:w="${W_NS}" xmlns:r="${R_NS}"></w:fonts>`, "utf-8"));
-      await this.contentTypes.addOverride(`/${FONT_TABLE}`, FONT_TABLE_CT);
-      const rels = this.read(DOC_RELS);
-      if (!/Target="fontTable\.xml"/.test(rels)) {
-        this.zip.addFile(DOC_RELS, Buffer.from(appendRel(rels, FONT_TABLE_REL, "fontTable.xml").xml, "utf-8"));
-      }
-      return;
-    }
-    const xml = this.read(FONT_TABLE);
-    if (!/<w:fonts\b[^>]*\bxmlns:r=/.test(xml)) {
-      this.zip.addFile(FONT_TABLE, Buffer.from(xml.replace(/<w:fonts\b/, `<w:fonts xmlns:r="${R_NS}"`), "utf-8"));
-    }
-  }
-
-  private addFontPart(bytes: Buffer): string {
-    let k = 1;
-    while (this.zip.getEntry(`word/fonts/font${k}.odttf`)) k++;
-    this.zip.addFile(`word/fonts/font${k}.odttf`, bytes);
-    return `fonts/font${k}.odttf`;
-  }
-
-  private addFontRel(target: string): string {
-    const rels = this.read(FONT_TABLE_RELS) || `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="${RELS_NS}"></Relationships>`;
-    const { xml, id } = appendRel(rels, FONT_REL, target);
-    this.zip.addFile(FONT_TABLE_RELS, Buffer.from(xml, "utf-8"));
-    return id;
-  }
-
-  private writeFontEntry(name: string, embeds: string): void {
-    const xml = this.read(FONT_TABLE);
-    const n = escRe(escAttr(name));
-    const open = new RegExp(`<w:font\\b[^>]*\\bw:name="${n}"[^>]*?(/?)>`);
-    const m = xml.match(open);
-    let next: string;
-    if (!m) {
-      next = xml.replace("</w:fonts>", `<w:font w:name="${escAttr(name)}">${embeds}</w:font></w:fonts>`);
-    } else if (m[1] === "/") {
-      next = xml.replace(m[0], `${m[0].slice(0, -2)}>${embeds}</w:font>`);
-    } else {
-      const start = (m.index as number) + m[0].length;
-      const end = xml.indexOf("</w:font>", start);
-      const body = xml.slice(start, end).replace(/<w:embed(Regular|Bold|Italic|BoldItalic)\b[^>]*\/>/g, "");
-      next = xml.slice(0, start) + body + embeds + xml.slice(end);
-    }
-    this.zip.addFile(FONT_TABLE, Buffer.from(next, "utf-8"));
-  }
-
-  /** Adds w:embedTrueTypeFonts in schema position. False when there is no settings part. */
-  private ensureEmbedSetting(): boolean {
+  /** The settings.xml text with w:embedTrueTypeFonts switched on (null = leave untouched). */
+  private resolveSettings(): { ok: boolean; xml: string | null } {
     const xml = this.read(SETTINGS);
-    if (!xml) return false;
-    if (xml.includes("<w:embedTrueTypeFonts")) return true;
-    let at = -1;
+    const existing = xml.match(/<w:embedTrueTypeFonts\b[^>]*?(?:\/>|>[\s\S]*?<\/w:embedTrueTypeFonts>)/);
+    if (existing) {
+      const off = /\bw:val="(0|false|off)"/.test(existing[0]);
+      return { ok: true, xml: off ? xml.replace(existing[0], () => "<w:embedTrueTypeFonts/>") : null };
+    }
+    const open = xml.match(/<w:settings\b[^>]*>/);
+    if (!open) return { ok: false, xml: null };
+    let at = (open.index as number) + open[0].length;
     for (const tag of SETTINGS_BEFORE) {
       const re = new RegExp(`<w:${tag}\\b[^>]*/>|<w:${tag}\\b[^>]*>[\\s\\S]*?</w:${tag}>`, "g");
       for (const m of xml.matchAll(re)) at = Math.max(at, (m.index as number) + m[0].length);
     }
-    if (at < 0) {
-      const open = xml.match(/<w:settings\b[^>]*>/) as RegExpMatchArray;
-      at = (open.index as number) + open[0].length;
-    }
-    this.zip.addFile(SETTINGS, Buffer.from(`${xml.slice(0, at)}<w:embedTrueTypeFonts/>${xml.slice(at)}`, "utf-8"));
-    return true;
+    return { ok: true, xml: `${xml.slice(0, at)}<w:embedTrueTypeFonts/>${xml.slice(at)}` };
   }
+}
+
+const EMBED_ANY = /<w:embed(Regular|Bold|Italic|BoldItalic)\b[^>]*?(?:\/>|>[\s\S]*?<\/w:embed\1>)/g;
+
+/** Removes the named font's existing embed elements; returns their relationship ids. */
+function stripOldEmbeds(xml: string, name: string): { next: string; oldIds: string[] } {
+  const m = xml.match(new RegExp(`<w:font\\b[^>]*\\bw:name="${escRe(escAttr(name))}"[^>]*?(/?)>`));
+  if (!m || m[1] === "/") return { next: xml, oldIds: [] };
+  const start = (m.index as number) + m[0].length;
+  const end = xml.indexOf("</w:font>", start);
+  const oldIds: string[] = [];
+  const body = xml.slice(start, end).replace(EMBED_ANY, (all) => {
+    const id = all.match(/\br:id="([^"]*)"/);
+    if (id) oldIds.push(id[1]);
+    return "";
+  });
+  return { next: xml.slice(0, start) + body + xml.slice(end), oldIds };
+}
+
+/** Appends the embeds to the named w:font (creating the entry when absent). */
+function insertFontEntry(xml: string, name: string, embeds: string): string {
+  const m = xml.match(new RegExp(`<w:font\\b[^>]*\\bw:name="${escRe(escAttr(name))}"[^>]*?(/?)>`));
+  if (!m) return xml.replace("</w:fonts>", () => `<w:font w:name="${escAttr(name)}">${embeds}</w:font></w:fonts>`);
+  if (m[1] === "/") return xml.replace(m[0], () => `${m[0].slice(0, -2)}>${embeds}</w:font>`);
+  const end = xml.indexOf("</w:font>", (m.index as number) + m[0].length);
+  return xml.slice(0, end) + embeds + xml.slice(end);
 }
 
 /** Appends a Relationship with the next free rIdN. */
@@ -166,5 +185,5 @@ export function appendRel(relsXml: string, type: string, target: string): { xml:
   const ids = [...relsXml.matchAll(/\bId="rId(\d+)"/g)].map((m) => Number(m[1]));
   const id = `rId${(ids.length ? Math.max(...ids) : 0) + 1}`;
   const rel = `<Relationship Id="${id}" Type="${type}" Target="${target}"/>`;
-  return { xml: relsXml.replace("</Relationships>", `${rel}</Relationships>`), id };
+  return { xml: relsXml.replace("</Relationships>", () => `${rel}</Relationships>`), id };
 }

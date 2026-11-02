@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import AdmZip from "adm-zip";
 import { Mdocxengine } from "../../index";
 import { checkDocxBuffer } from "../../doctor";
+import { FontTableManager } from "./FontTableManager";
 import { obfuscateFont } from "../fonts/obfuscate";
 
 const SAMPLE = readFileSync(new URL("../../../samples/example.docx", import.meta.url));
@@ -121,10 +122,131 @@ describe("FontTableManager.embedFont", () => {
     expect(text(e, "word/_rels/document.xml.rels")).toMatch(/relationships\/fontTable"[^>]*Target="fontTable.xml"|Target="fontTable.xml"[^>]*relationships\/fontTable"/);
   });
 
-  it("does not duplicate an existing document rel to fontTable.xml", async () => {
-    const e = await load((z) => z.deleteFile("word/fontTable.xml"));
+  it("does not duplicate an existing document rel or override for fontTable.xml", async () => {
+    const e = await load((z) => {
+      const rels = z.readAsText("word/_rels/document.xml.rels").replace(
+        "</Relationships>",
+        '<Relationship Id="rId99" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/fontTable" Target="fontTable.xml"/></Relationships>');
+      z.addFile("word/_rels/document.xml.rels", Buffer.from(rels));
+      const ct = z.readAsText("[Content_Types].xml").replace(
+        "</Types>",
+        '<Override PartName="/word/fontTable.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml"/></Types>');
+      z.addFile("[Content_Types].xml", Buffer.from(ct));
+      z.deleteFile("word/fontTable.xml");
+    });
     await e.fontTable.embedFont({ name: "Amiri", regular: fakeFont(0) });
     expect(text(e, "word/_rels/document.xml.rels").match(/Target="fontTable\.xml"/g)).toHaveLength(1);
+    expect(text(e, "[Content_Types].xml").match(/PartName="\/word\/fontTable\.xml"/g)).toHaveLength(1);
+  });
+
+  it("embeds into a registered Word-shaped fontTable without touching anything else", async () => {
+    const calibri = '<w:font w:name="Calibri"><w:panose1 w:val="020F0502020204030204"/><w:charset w:val="00"/><w:family w:val="swiss"/></w:font>';
+    const e = await load((z) => {
+      z.addFile("word/fontTable.xml", Buffer.from(
+        '<?xml version="1.0"?><w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+        '<w:font w:name="Traditional Arabic"><w:panose1 w:val="02020603050405020304"/><w:charset w:val="B2"/><w:family w:val="roman"/><w:pitch w:val="variable"/>' +
+        '<w:sig w:usb0="00002003" w:usb1="80000000" w:usb2="00000008" w:usb3="00000000" w:csb0="00000041" w:csb1="00000000"/></w:font>' +
+        calibri + '</w:fonts>'));
+      const rels = z.readAsText("word/_rels/document.xml.rels").replace(
+        "</Relationships>",
+        '<Relationship Id="rId99" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/fontTable" Target="fontTable.xml"/></Relationships>');
+      z.addFile("word/_rels/document.xml.rels", Buffer.from(rels));
+      const ct = z.readAsText("[Content_Types].xml").replace(
+        "</Types>",
+        '<Override PartName="/word/fontTable.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml"/></Types>');
+      z.addFile("[Content_Types].xml", Buffer.from(ct));
+    });
+    await e.fontTable.embedFont({ name: "Traditional Arabic", regular: fakeFont(0), bold: fakeFont(0) });
+    expect(text(e, "word/_rels/document.xml.rels").match(/Target="fontTable\.xml"/g)).toHaveLength(1);
+    expect(text(e, "[Content_Types].xml").match(/PartName="\/word\/fontTable\.xml"/g)).toHaveLength(1);
+    const ft = text(e, "word/fontTable.xml");
+    expect(ft.match(/xmlns:r=/g)).toHaveLength(1);
+    expect(ft).toMatch(/<w:sig [^>]*\/><w:embedRegular [^>]*\/><w:embedBold [^>]*\/><\/w:font>/);
+    expect(ft).toContain(calibri);
+  });
+
+  it("embeddedFonts is not fooled by a self-closing entry before an embedded one", async () => {
+    const e = await load((z) => z.addFile("word/fontTable.xml", Buffer.from(
+      '<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+      '<w:font w:name="Tahoma"/><w:font w:name="Calibri"><w:charset w:val="00"/><w:embedRegular r:id="rId1" w:fontKey="{X}"/></w:font></w:fonts>')));
+    expect(e.fontTable.embeddedFonts()).toEqual(["Calibri"]);
+  });
+
+  it("re-embedding a font leaves no orphan parts or relationships", async () => {
+    const e = await load();
+    await e.fontTable.embedFont({ name: "Amiri", regular: fakeFont(0, 1), bold: fakeFont(0, 2) });
+    await e.fontTable.embedFont({ name: "Amiri", regular: fakeFont(0, 3) });
+    const parts = e.zip.getEntries().map((x) => x.entryName).filter((n) => n.startsWith("word/fonts/"));
+    expect(parts).toHaveLength(1);
+    const rels = text(e, "word/_rels/fontTable.xml.rels");
+    expect(rels.match(/<Relationship /g)).toHaveLength(1);
+    const ft = text(e, "word/fontTable.xml");
+    expect(ft.match(/<w:embed\w+/g)).toHaveLength(1);
+    const key = ft.match(/w:fontKey="(\{[^"]+\})"/)![1];
+    expect(obfuscateFont(e.zip.getEntry(parts[0])!.getData(), key)).toEqual(fakeFont(0, 3));
+  });
+
+  it("strips old embeds written as open/close tags, and keeps unrelated parts", async () => {
+    const e = await load((z) => {
+      z.addFile("word/fontTable.xml", Buffer.from(
+        '<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+        '<w:font w:name="Amiri"><w:embedRegular r:id="rId1" w:fontKey="{A}"></w:embedRegular></w:font></w:fonts>'));
+      z.addFile("word/_rels/fontTable.xml.rels", Buffer.from(
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+        '<Relationship Id="rId1" Type="x" Target="fonts/font1.odttf"/></Relationships>'));
+      z.addFile("word/fonts/font1.odttf", Buffer.alloc(40));
+    });
+    await e.fontTable.embedFont({ name: "Amiri", regular: fakeFont(0) });
+    const ft = text(e, "word/fontTable.xml");
+    expect(ft).not.toContain("</w:embedRegular>");
+    expect(ft.match(/<w:embed\w+/g)).toHaveLength(1);
+    expect(text(e, "word/_rels/fontTable.xml.rels").match(/<Relationship /g)).toHaveLength(1);
+  });
+
+  it("tolerates a stale embed whose relationship is missing or has no target", async () => {
+    const e = await load((z) => {
+      z.addFile("word/fontTable.xml", Buffer.from(
+        '<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+        '<w:font w:name="Amiri"><w:embedRegular r:id="rId5" w:fontKey="{A}"/><w:embedBold r:id="rId6" w:fontKey="{B}"/><w:embedItalic w:fontKey="{C}"/></w:font></w:fonts>'));
+      z.addFile("word/_rels/fontTable.xml.rels", Buffer.from(
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId6" Type="x"/></Relationships>'));
+    });
+    const res = await e.fontTable.embedFont({ name: "Amiri", regular: fakeFont(0) });
+    expect(res.embedded).toBe(true);
+    expect(text(e, "word/fontTable.xml").match(/<w:embed\w+/g)).toHaveLength(1);
+  });
+
+  it("treats $ sequences in a font name literally", async () => {
+    const e = await load();
+    await e.fontTable.embedFont({ name: "A$&B", regular: fakeFont(0) });
+    expect(text(e, "word/fontTable.xml")).toContain('<w:font w:name="A$&amp;B">');
+    expect(e.fontTable.listFonts()).toContain("A$&B");
+  });
+
+  it("turns on an existing embedTrueTypeFonts that is switched off", async () => {
+    for (const v of ["0", "false", "off"]) {
+      const e = await load((z) => z.addFile("word/settings.xml", Buffer.from(
+        `<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:embedTrueTypeFonts w:val="${v}"/><w:defaultTabStop w:val="720"/></w:settings>`)));
+      const res = await e.fontTable.embedFont({ name: "A", regular: fakeFont(0) });
+      expect(res.settingsUpdated).toBe(true);
+      expect(text(e, "word/settings.xml")).toContain('<w:embedTrueTypeFonts/><w:defaultTabStop');
+      expect(text(e, "word/settings.xml")).not.toContain(`w:val="${v}"`);
+    }
+  });
+
+  it("leaves an already-on embedTrueTypeFonts alone", async () => {
+    const xml = '<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:embedTrueTypeFonts w:val="1"/></w:settings>';
+    const e = await load((z) => z.addFile("word/settings.xml", Buffer.from(xml)));
+    const res = await e.fontTable.embedFont({ name: "A", regular: fakeFont(0) });
+    expect(res.settingsUpdated).toBe(true);
+    expect(text(e, "word/settings.xml")).toBe(xml);
+  });
+
+  it("still embeds, without throwing, when settings.xml has no w:settings open tag", async () => {
+    const e = await load((z) => z.addFile("word/settings.xml", Buffer.from('<settings xmlns="http://schemas.openxmlformats.org/wordprocessingml/2006/main"></settings>')));
+    const res = await e.fontTable.embedFont({ name: "A", regular: fakeFont(0) });
+    expect(res).toMatchObject({ embedded: true, settingsUpdated: false });
+    expect(text(e, "word/settings.xml")).not.toContain("embedTrueTypeFonts");
   });
 
   it("places embedTrueTypeFonts after the settings it must follow, once", async () => {
@@ -161,7 +283,7 @@ describe("FontTableManager.embedFont", () => {
 
   it("generates a fresh GUID font key by default", async () => {
     const e = await load();
-    e.fontTable = new (e.fontTable.constructor as any)(e.zip, e.contentTypes);
+    e.fontTable = new FontTableManager(e.zip, e.contentTypes);
     const font = fakeFont(0);
     await e.fontTable.embedFont({ name: "Amiri", regular: font });
     const key = text(e, "word/fontTable.xml").match(/w:fontKey="(\{[0-9A-F-]{36}\})"/)![1];
