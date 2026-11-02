@@ -175,7 +175,7 @@ export class MergeManager {
    * different URI is a real conflict: throw rather than silently mis-bind.
    */
   private carryNamespaces(source: MdocxengineType): void {
-    for (const part of ["word/document.xml", "word/footnotes.xml", "word/endnotes.xml", "word/numbering.xml"]) {
+    for (const part of ["word/document.xml", "word/styles.xml", "word/footnotes.xml", "word/endnotes.xml", "word/numbering.xml"]) {
       const targetXml = this.zip.readAsText(part);
       const sourceXml = source.zip.readAsText(part);
       if (!targetXml || !sourceXml) continue;
@@ -205,7 +205,14 @@ export class MergeManager {
     const mediaMap = await this.buildMediaMap(source, srcRels, scan);
     const hyperlinkMap = await this.buildHyperlinkMap(srcRels, scan);
     const footnoteMap = await this.buildFootnoteMap(source, scan);
-    const numberingMap = await this.buildNumberingMap(source, scan);
+    const importedStyles = this.collectMissingStyles(source, scan, styleMap);
+    // One numbering pass over blocks AND imported styles, so a list used by both
+    // maps to the same copied definition.
+    const numberingMap = await this.buildNumberingMap(
+      source,
+      scan + "\n" + importedStyles.map((x) => x.xml).join("\n"),
+    );
+    this.importStyles(importedStyles, numberingMap);
     const chartMap = await this.buildChartMap(source, srcRels, scan);
     const vmlOleMap = await this.buildVmlOleMap(source, srcRels, scan);
     const ids = this.planIds(scan);
@@ -394,6 +401,60 @@ export class MergeManager {
         idMap[val] ? `${a}${idMap[val]}${c}` : full,
       ),
     );
+  }
+
+  // ─── Styles ─────────────────────────────────────────────────────────────────
+  //
+  // A merge copies blocks, not style DEFINITIONS, so a `pStyle`/`rStyle`/`tblStyle`
+  // the target does not define dangles (one real thesis: 1052 uses of 8 ids) and
+  // Word silently renders it as Normal. We import every referenced source style
+  // the target LACKS, with its basedOn/link/next chain.
+  //
+  // LIMITATION: when the styleId already exists in the target, the TARGET's
+  // definition wins and the source's is NOT imported — the copied text takes the
+  // target's look. That is the intended "the template owns the look" behaviour of
+  // the combine flow, but two documents that define the same id differently are
+  // not reconciled (no renaming of styles).
+
+  private collectMissingStyles(
+    source: MdocxengineType,
+    blocksXml: string,
+    styleMap: Record<string, string>,
+  ): { id: string; xml: string }[] {
+    const srcStyles = source.zip.readAsText("word/styles.xml");
+    const tgtStyles = this.zip.readAsText("word/styles.xml");
+    if (!srcStyles || !tgtStyles?.includes("</w:styles>")) return [];
+
+    const defs = new Map<string, string>();
+    for (const m of srcStyles.matchAll(/<w:style\b[^>]*\bw:styleId="([^"]+)"[^>]*>[\s\S]*?<\/w:style>/g)) {
+      defs.set(m[1], m[0]);
+    }
+    const inTarget = new Set(
+      [...tgtStyles.matchAll(/<w:style\b[^>]*\bw:styleId="([^"]+)"/g)].map((m) => m[1]),
+    );
+
+    const out: { id: string; xml: string }[] = [];
+    const seen = new Set<string>();
+    const visit = (id: string) => {
+      if (seen.has(id) || inTarget.has(id) || styleMap[id]) return;
+      seen.add(id);
+      const def = defs.get(id);
+      if (!def) return; // undefined in the source too — nothing to import
+      // Only one default style per type: the target keeps its own.
+      const xml = def.replace(/^(<w:style\b[^>]*?)\s+w:default="(?:1|true|on)"/, "$1");
+      out.push({ id, xml });
+      for (const m of def.matchAll(/<w:(?:basedOn|link|next)\b[^>]*\bw:val="([^"]+)"/g)) visit(m[1]);
+    };
+    for (const m of blocksXml.matchAll(/<w:(?:pStyle|rStyle|tblStyle)\b[^>]*\bw:val="([^"]+)"/g)) visit(m[1]);
+    return out;
+  }
+
+  private importStyles(styles: { id: string; xml: string }[], numberingMap: Record<string, string>): void {
+    if (styles.length === 0) return;
+    const tgt = this.zip.readAsText("word/styles.xml");
+    const close = tgt.lastIndexOf("</w:styles>");
+    const add = styles.map((x) => this.applyNumIdMap(x.xml, numberingMap)).join("");
+    this.zip.addFile("word/styles.xml", Buffer.from(tgt.slice(0, close) + add + tgt.slice(close), "utf8"));
   }
 
   // ─── Unique ids: drawing ids + bookmarks ─────────────────────────────────────
