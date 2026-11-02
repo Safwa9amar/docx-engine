@@ -1,6 +1,15 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import AdmZip from "adm-zip";
-import { inspectDocx, firstXmlError, clearFalseDataDescriptors, type DocxZip } from "./index";
+import { ZipManager } from "@/utils/ZipManager";
+import {
+  inspectDocx,
+  firstXmlError,
+  clearFalseDataDescriptors,
+  checkDocxBuffer,
+  repairDocxBuffer,
+  inspectZipFlags,
+  type DocxZip,
+} from "./index";
 
 // ── Fixture builders ─────────────────────────────────────────────────────────
 //
@@ -450,6 +459,382 @@ describe("clearFalseDataDescriptors", () => {
   it("returns the input untouched when it is not a zip at all", () => {
     const junk = Buffer.from("not a zip");
     expect(clearFalseDataDescriptors(junk).equals(junk)).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Zip-level flags. Every "Word" claim below was measured through real Word
+// (Mac, 2026-11-02) on the seed document with exactly this forgery:
+//   non-empty entry, bit 3 in the local header, no descriptor → refused (-10000);
+//   the same on one single entry                              → refused;
+//   the same on a directory or an empty file                  → opens;
+//   bit 3 in the central directory only                       → opens;
+//   a true streamed archive (real descriptors)                → opens;
+//   CRC 0 on a non-empty entry, no flag                       → opens, unzip -t fails.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Every entry's header offsets, read off the central directory. */
+function zipOffsets(buf: Buffer): { name: string; central: number; local: number }[] {
+  const eocd = buf.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  const out: { name: string; central: number; local: number }[] = [];
+  let p = buf.readUInt32LE(eocd + 16);
+  for (let n = buf.readUInt16LE(eocd + 10); n > 0; n--) {
+    const nameLen = buf.readUInt16LE(p + 28);
+    out.push({ name: buf.toString("utf8", p + 46, p + 46 + nameLen), central: p, local: buf.readUInt32LE(p + 42) });
+    p += 46 + nameLen + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32);
+  }
+  return out;
+}
+
+/** Set bit 3 on the entries `pick` chooses, the way adm-zip leaves a streamed upload. */
+function forgeBit3(src: Buffer, pick: (name: string) => boolean = () => true, where: "both" | "central" | "local" = "both"): Buffer {
+  const buf = Buffer.from(src);
+  for (const e of zipOffsets(buf)) {
+    if (!pick(e.name)) continue;
+    if (where !== "local") buf.writeUInt16LE(buf.readUInt16LE(e.central + 8) | 0x0008, e.central + 8);
+    if (where !== "central") buf.writeUInt16LE(buf.readUInt16LE(e.local + 6) | 0x0008, e.local + 6);
+  }
+  return buf;
+}
+
+const bit3Everywhere = (buf: Buffer) =>
+  zipOffsets(buf).filter((e) => (buf.readUInt16LE(e.central + 8) | buf.readUInt16LE(e.local + 6)) & 0x0008).map((e) => e.name);
+
+const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  return c >>> 0;
+});
+const crc32 = (b: Buffer) => {
+  let c = 0xffffffff;
+  for (const x of b) c = CRC_TABLE[(c ^ x) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+};
+
+/** A really streamed archive: bit 3, zeros in the local headers, the real values in a descriptor behind the data (stored). */
+function streamedZip(files: Record<string, string>, opts: { signature?: boolean; directories?: string[] } = {}): Buffer {
+  const signed = opts.signature !== false;
+  const chunks: Buffer[] = [];
+  const central: Buffer[] = [];
+  let at = 0;
+  const add = (name: string, data: Buffer) => {
+    const nameBuf = Buffer.from(name, "utf8");
+    const crc = crc32(data);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x0008, 6);
+    local.writeUInt16LE(nameBuf.length, 26);
+    const desc = Buffer.alloc(signed ? 16 : 12);
+    let d = 0;
+    if (signed) { desc.writeUInt32LE(0x08074b50, 0); d = 4; }
+    desc.writeUInt32LE(crc, d);
+    desc.writeUInt32LE(data.length, d + 4);
+    desc.writeUInt32LE(data.length, d + 8);
+    const c = Buffer.alloc(46);
+    c.writeUInt32LE(0x02014b50, 0);
+    c.writeUInt16LE(20, 4);
+    c.writeUInt16LE(20, 6);
+    c.writeUInt16LE(0x0008, 8);
+    c.writeUInt32LE(crc, 16);
+    c.writeUInt32LE(data.length, 20);
+    c.writeUInt32LE(data.length, 24);
+    c.writeUInt16LE(nameBuf.length, 28);
+    c.writeUInt32LE(at, 42);
+    central.push(c, nameBuf);
+    chunks.push(local, nameBuf, data, desc);
+    at += local.length + nameBuf.length + data.length + desc.length;
+  };
+  for (const dir of opts.directories ?? []) add(dir, Buffer.alloc(0));
+  for (const [name, text] of Object.entries(files)) add(name, Buffer.from(text, "utf8"));
+  const dirBytes = Buffer.concat(central);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(central.length / 2, 8);
+  eocd.writeUInt16LE(central.length / 2, 10);
+  eocd.writeUInt32LE(dirBytes.length, 12);
+  eocd.writeUInt32LE(at, 16);
+  return Buffer.concat([...chunks, dirBytes, eocd]);
+}
+
+const PKG_PARTS = (body = P() + SECT) => ({
+  "[Content_Types].xml": CONTENT_TYPES(),
+  "_rels/.rels": ROOT_RELS,
+  "word/document.xml": doc(body),
+});
+
+/** A package carrying an empty entry too. */
+function pkgWithEmpty(): Buffer {
+  const zip = pkg(P() + SECT);
+  zip.addFile("customXml/empty.bin", Buffer.alloc(0));
+  zip.addFile("word/", Buffer.alloc(0));
+  return zip.toBuffer();
+}
+const isEmptyEntry = (n: string) => n === "customXml/empty.bin" || n.endsWith("/");
+const ruleOf = (r: { findings: { rule: string }[] }, rule: string) => r.findings.find((f) => f.rule === rule) as any;
+const zipRules = (r: { findings: { rule: string }[] }) => r.findings.map((f) => f.rule).filter((x) => x.startsWith("zip."));
+
+describe("inspectZipFlags", () => {
+  it("is silent on an ordinary archive and on a truly streamed one", () => {
+    const empty = { falseDescriptors: [], toleratedFalseDescriptors: [], zeroCrc: [] };
+    expect(inspectZipFlags(pkg(P() + SECT).toBuffer())).toEqual(empty);
+    expect(inspectZipFlags(pkgWithEmpty())).toEqual(empty);
+    expect(inspectZipFlags(streamedZip(PKG_PARTS()))).toEqual(empty);
+    expect(inspectZipFlags(streamedZip(PKG_PARTS(), { signature: false }))).toEqual(empty);
+    expect(inspectZipFlags(streamedZip(PKG_PARTS(), { directories: ["word/"] }))).toEqual(empty);
+    expect(inspectZipFlags(streamedZip(PKG_PARTS(), { directories: ["word/"], signature: false }))).toEqual(empty);
+  });
+
+  it("names a false flag on a non-empty entry, in both headers or the local one", () => {
+    const buf = pkg(P() + SECT).toBuffer();
+    expect(inspectZipFlags(forgeBit3(buf, (n) => n === "word/document.xml"))!.falseDescriptors).toEqual(["word/document.xml"]);
+    expect(inspectZipFlags(forgeBit3(buf, (n) => n === "word/document.xml", "local"))!.falseDescriptors).toEqual(["word/document.xml"]);
+    expect(inspectZipFlags(forgeBit3(buf))!.falseDescriptors).toHaveLength(3);
+  });
+
+  it("files what Word tolerates apart: empty entries and a central-only flag", () => {
+    const buf = pkgWithEmpty();
+    const empties = inspectZipFlags(forgeBit3(buf, isEmptyEntry))!;
+    expect(empties.falseDescriptors).toEqual([]);
+    expect(empties.toleratedFalseDescriptors.sort()).toEqual(["customXml/empty.bin", "word/"]);
+    const central = inspectZipFlags(forgeBit3(buf, (n) => n === "word/document.xml", "central"))!;
+    expect(central.falseDescriptors).toEqual([]);
+    expect(central.toleratedFalseDescriptors).toEqual(["word/document.xml"]);
+  });
+
+  it("names a non-empty entry that records CRC 0, but never an empty one", () => {
+    const buf = Buffer.from(pkgWithEmpty());
+    const e = zipOffsets(buf).find((x) => x.name === "_rels/.rels")!;
+    buf.writeUInt32LE(0, e.central + 16);
+    buf.writeUInt32LE(0, e.local + 14);
+    expect(inspectZipFlags(buf)).toEqual({ falseDescriptors: [], toleratedFalseDescriptors: [], zeroCrc: ["_rels/.rels"] });
+  });
+
+  it("returns null on what it cannot walk", () => {
+    expect(inspectZipFlags(Buffer.from("not a zip"))).toBeNull();
+    const buf = Buffer.from(pkg(P() + SECT).toBuffer());
+    const eocd = buf.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+    const zip64 = Buffer.from(buf);
+    zip64.writeUInt16LE(0xffff, eocd + 10);
+    expect(inspectZipFlags(zip64)).toBeNull();
+    const broken = Buffer.from(buf);
+    broken.writeUInt32LE(0, broken.readUInt32LE(eocd + 16));
+    expect(inspectZipFlags(broken)).toBeNull();
+  });
+});
+
+describe("clearFalseDataDescriptors, the entries it used to skip", () => {
+  it("clears a false flag on a CRC-0 directory and on an empty file", () => {
+    const forged = forgeBit3(pkgWithEmpty(), isEmptyEntry);
+    expect(bit3Everywhere(forged).sort()).toEqual(["customXml/empty.bin", "word/"]);
+    expect(bit3Everywhere(clearFalseDataDescriptors(forged))).toEqual([]);
+  });
+
+  it("clears every flag adm-zip leaves on a streamed upload it re-wrote, directories included", () => {
+    const rewritten = new AdmZip(streamedZip(PKG_PARTS(), { directories: ["word/"] })).toBuffer();
+    expect(bit3Everywhere(rewritten).length).toBe(4);
+    const fixed = clearFalseDataDescriptors(rewritten);
+    expect(bit3Everywhere(fixed)).toEqual([]);
+    expect(new AdmZip(fixed).readAsText("word/document.xml")).toContain("hello");
+  });
+
+  it("clears a flag standing in only one of the two headers", () => {
+    const buf = pkg(P() + SECT).toBuffer();
+    expect(bit3Everywhere(clearFalseDataDescriptors(forgeBit3(buf, undefined, "central")))).toEqual([]);
+    expect(bit3Everywhere(clearFalseDataDescriptors(forgeBit3(buf, undefined, "local")))).toEqual([]);
+  });
+
+  it("leaves a truly streamed archive byte-identical, signed or not, directories included", () => {
+    for (const b of [streamedZip(PKG_PARTS()), streamedZip(PKG_PARTS(), { signature: false, directories: ["word/"] })]) {
+      expect(clearFalseDataDescriptors(b)).toBe(b);
+    }
+  });
+
+  it("in a mixed archive clears the false flag and keeps the true one", () => {
+    const streamed = streamedZip({ "a.xml": "<a/>", "b.xml": "<b/>" });
+    // Turn a.xml into the adm-zip state: real values in the local header, no descriptor.
+    const zip = new AdmZip();
+    zip.addFile("first.xml", Buffer.from("<first/>", "utf8"));
+    const normal = forgeBit3(zip.toBuffer());
+    const merged = appendEntries(normal, streamed);
+    const fixed = clearFalseDataDescriptors(merged);
+    expect(bit3Everywhere(fixed).sort()).toEqual(["a.xml", "b.xml"]);
+    const z = new AdmZip(fixed);
+    for (const [n, t] of [["first.xml", "<first/>"], ["a.xml", "<a/>"], ["b.xml", "<b/>"]]) expect(z.readAsText(n)).toBe(t);
+  });
+
+  it("bails on a flagged entry whose local header disagrees and has no descriptor: it never guesses", () => {
+    const buf = forgeBit3(pkg(P() + SECT).toBuffer());
+    const e = zipOffsets(buf).find((x) => x.name === "word/document.xml")!;
+    buf.writeUInt32LE(0, e.local + 14); // local CRC gone, nothing behind the data to recover it from
+    expect(clearFalseDataDescriptors(buf)).toBe(buf);
+    expect(inspectZipFlags(buf)).toBeNull();
+  });
+});
+
+/** The two archives' entries in one zip: `head`'s entries first, then `tail`'s, offsets adjusted. */
+function appendEntries(head: Buffer, tail: Buffer): Buffer {
+  const eocdOf = (b: Buffer) => b.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  const h = eocdOf(head);
+  const t = eocdOf(tail);
+  const hDir = head.readUInt32LE(h + 16);
+  const tDir = tail.readUInt32LE(t + 16);
+  const tailCentral = Buffer.from(tail.subarray(tDir, t));
+  let p = 0;
+  for (let n = tail.readUInt16LE(t + 10); n > 0; n--) {
+    tailCentral.writeUInt32LE(tailCentral.readUInt32LE(p + 42) + hDir, p + 42);
+    p += 46 + tailCentral.readUInt16LE(p + 28) + tailCentral.readUInt16LE(p + 30) + tailCentral.readUInt16LE(p + 32);
+  }
+  const headCentral = head.subarray(hDir, h);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  const count = head.readUInt16LE(h + 10) + tail.readUInt16LE(t + 10);
+  eocd.writeUInt16LE(count, 8);
+  eocd.writeUInt16LE(count, 10);
+  eocd.writeUInt32LE(headCentral.length + tailCentral.length, 12);
+  eocd.writeUInt32LE(hDir + tDir, 16);
+  return Buffer.concat([head.subarray(0, hDir), tail.subarray(0, tDir), headCentral, tailCentral, eocd]);
+}
+
+describe("docx-doctor: the package's own zip flags", () => {
+  it("a healthy package reports no zip finding through either byte-level door", async () => {
+    const buf = pkg(P() + SECT).toBuffer();
+    expect(zipRules(await checkDocxBuffer(buf))).toEqual([]);
+    const repaired = await repairDocxBuffer(buf);
+    expect(zipRules(repaired)).toEqual([]);
+    expect(repaired.changed).toBe(false);
+    expect(repaired.buffer).toBe(buf);
+  });
+
+  it("a truly streamed package is healthy and stays byte-identical", async () => {
+    const buf = streamedZip(PKG_PARTS(), { directories: ["word/"] });
+    const checked = await checkDocxBuffer(buf);
+    expect(zipRules(checked)).toEqual([]);
+    expect(checked.ok).toBe(true);
+    const repaired = await repairDocxBuffer(buf);
+    expect(repaired.changed).toBe(false);
+    expect(repaired.buffer).toBe(buf);
+  });
+
+  it("check: a false descriptor on a non-empty entry is FATAL, the doctor no longer says ok", async () => {
+    const report = await checkDocxBuffer(forgeBit3(pkg(P() + SECT).toBuffer()));
+    expect(report.ok).toBe(false);
+    const f = ruleOf(report, "zip.false-data-descriptor");
+    expect(f).toMatchObject({ severity: "fatal", part: "package", count: 3, fixable: true, fixed: false });
+    expect(f.detail).toContain("word/document.xml");
+    expect(report.findings[0].rule).toBe("zip.false-data-descriptor"); // fatals sort first
+  });
+
+  it("check: it still reads the parts behind a false flag (they used to read as nothing, so every check passed)", async () => {
+    const zip = pkg(P() + SECT);
+    zip.addFile("word/document.xml", Buffer.from("<w:document><w:body><w:p></w:body>", "utf8"));
+    const report = await checkDocxBuffer(forgeBit3(zip.toBuffer()));
+    expect(report.findings.map((x) => x.rule)).toEqual(expect.arrayContaining(["zip.false-data-descriptor", "xml.malformed"]));
+  });
+
+  it("check never modifies the buffer it is given", async () => {
+    const forged = forgeBit3(pkg(P() + SECT).toBuffer());
+    const copy = Buffer.from(forged);
+    await checkDocxBuffer(forged);
+    expect(forged.equals(copy)).toBe(true);
+  });
+
+  it("repair clears the flags, says so, and the bytes read back", async () => {
+    const forged = forgeBit3(pkg(P() + SECT).toBuffer());
+    const copy = Buffer.from(forged);
+    const r = await repairDocxBuffer(forged);
+    expect(forged.equals(copy)).toBe(true);
+    expect(r.changed).toBe(true);
+    expect(r.ok).toBe(true);
+    expect(r.repairedParts).toEqual([]);
+    expect(ruleOf(r, "zip.false-data-descriptor")).toMatchObject({ severity: "fatal", count: 3, fixed: true });
+    expect(bit3Everywhere(r.buffer)).toEqual([]);
+    expect(new AdmZip(r.buffer).readAsText("word/document.xml")).toContain("hello");
+    // and it is now clean through the checking door
+    expect(zipRules(await checkDocxBuffer(r.buffer))).toEqual([]);
+  });
+
+  it("repair reports the cleared flags alongside a part it also rewrote", async () => {
+    // A table as the last body block: the doctor appends the spacer paragraph.
+    const forged = forgeBit3(pkg(TBL() + SECT).toBuffer());
+    const r = await repairDocxBuffer(forged);
+    expect(r.repairedParts).toContain("word/document.xml");
+    expect(r.changed).toBe(true);
+    expect(ruleOf(r, "zip.false-data-descriptor")).toMatchObject({ count: 3, fixed: true });
+    expect(bit3Everywhere(r.buffer)).toEqual([]);
+    expect(r.ok).toBe(true);
+  });
+
+  it("an abandoned repair leaves the flags reported and unfixed, on the original bytes", async () => {
+    const forged = forgeBit3(pkg(TBL() + SECT).toBuffer());
+    // Sabotage only the first open: its rewrite cannot be serialised, so the repair gives up.
+    const real = ZipManager.loadFromBuffer;
+    const spy = vi.spyOn(ZipManager, "loadFromBuffer").mockImplementationOnce(async (b: Buffer) => {
+      const z = await real.call(ZipManager, b);
+      (z as any).toBuffer = () => { throw new Error("no bytes"); };
+      return z;
+    });
+    try {
+      const abandoned = await repairDocxBuffer(forged);
+      expect(abandoned.buffer).toBe(forged);
+      expect(abandoned.changed).toBe(false);
+      expect(ruleOf(abandoned, "repair.abandoned")).toBeTruthy();
+      expect(ruleOf(abandoned, "zip.false-data-descriptor")).toMatchObject({ fixed: false });
+      expect(abandoned.ok).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("flags on empty entries are a WARNING, and repair clears them too", async () => {
+    const forged = forgeBit3(pkgWithEmpty(), isEmptyEntry);
+    const checked = await checkDocxBuffer(forged);
+    expect(checked.ok).toBe(true);
+    expect(ruleOf(checked, "zip.false-data-descriptor")).toBeUndefined();
+    expect(ruleOf(checked, "zip.false-data-descriptor-tolerated")).toMatchObject({ severity: "warning", count: 2, fixable: true, fixed: false });
+    const r = await repairDocxBuffer(forged);
+    expect(r.changed).toBe(true);
+    expect(ruleOf(r, "zip.false-data-descriptor-tolerated")).toMatchObject({ count: 2, fixed: true });
+    expect(bit3Everywhere(r.buffer)).toEqual([]);
+  });
+
+  it("a CRC-0 entry is flagged, not fixable, and repair leaves it alone", async () => {
+    const buf = Buffer.from(pkg(P() + SECT).toBuffer());
+    const e = zipOffsets(buf).find((x) => x.name === "_rels/.rels")!;
+    buf.writeUInt32LE(0, e.central + 16);
+    buf.writeUInt32LE(0, e.local + 14);
+    const checked = await checkDocxBuffer(buf);
+    expect(ruleOf(checked, "zip.crc-zero")).toMatchObject({ severity: "warning", count: 1, fixable: false, fixed: false });
+    expect(ruleOf(checked, "zip.crc-zero").detail).toContain("_rels/.rels");
+    const r = await repairDocxBuffer(buf);
+    expect(r.changed).toBe(false);
+    expect(r.buffer).toBe(buf);
+    expect(ruleOf(r, "zip.crc-zero")).toMatchObject({ fixed: false });
+  });
+
+  it("a CRC-0 entry with a false flag loses the flag, keeps the zero, and both are reported", async () => {
+    const buf = forgeBit3(pkg(P() + SECT).toBuffer(), (n) => n === "_rels/.rels");
+    const e = zipOffsets(buf).find((x) => x.name === "_rels/.rels")!;
+    buf.writeUInt32LE(0, e.central + 16);
+    buf.writeUInt32LE(0, e.local + 14);
+    const checked = await checkDocxBuffer(buf);
+    expect(ruleOf(checked, "zip.false-data-descriptor")).toMatchObject({ severity: "fatal", count: 1 });
+    expect(ruleOf(checked, "zip.crc-zero")).toMatchObject({ count: 1 });
+    const r = await repairDocxBuffer(buf);
+    expect(r.changed).toBe(true);
+    expect(bit3Everywhere(r.buffer)).toEqual([]);
+    expect(ruleOf(r, "zip.false-data-descriptor")).toMatchObject({ fixed: true });
+    expect(ruleOf(r, "zip.crc-zero")).toMatchObject({ fixed: false });
+    expect(r.ok).toBe(true);
+  });
+
+  it("the real path: a streamed upload re-written by adm-zip is caught, then healed", async () => {
+    const rewritten = new AdmZip(streamedZip(PKG_PARTS())).toBuffer();
+    const checked = await checkDocxBuffer(rewritten);
+    expect(ruleOf(checked, "zip.false-data-descriptor")).toMatchObject({ severity: "fatal", count: 3 });
+    const r = await repairDocxBuffer(rewritten);
+    expect(r.ok).toBe(true);
+    expect(new AdmZip(r.buffer).readAsText("word/document.xml")).toContain("hello");
   });
 });
 

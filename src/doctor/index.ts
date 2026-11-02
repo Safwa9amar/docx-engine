@@ -30,8 +30,9 @@
  *    `[Content_Types].xml` overrides, duplicate rIds — each on its own makes Word
  *    refuse the document.
  *  • **Lying zip flags.** adm-zip re-writes a streamed archive keeping the
- *    "a data descriptor follows" flag it did not honour, and then cannot read its
- *    own output back. See `clearFalseDataDescriptors`.
+ *    "a data descriptor follows" flag it did not honour. It then cannot read its
+ *    own output back, and Word refuses the file. The byte-level wrappers report
+ *    these as `zip.*` findings. See `inspectZipFlags`, `clearFalseDataDescriptors`.
  *
  * ## Shape of the module
  *
@@ -1688,92 +1689,233 @@ export function inspectDocx(zip: DocxZip, opts: InspectOptions = {}): DoctorRepo
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Zip-level repair
+// Zip-level inspection and repair
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SIG_EOCD = 0x06054b50;
 const SIG_CENTRAL = 0x02014b50;
 const SIG_LOCAL = 0x04034b50;
+const SIG_DESCRIPTOR = 0x08074b50;
 /** General-purpose bit 3: "sizes and CRC live in a trailing data descriptor". */
 const FLAG_DATA_DESCRIPTOR = 0x0008;
 
+/** One zip entry as the bytes state it. */
+interface ZipEntryFacts {
+  name: string;
+  centralAt: number;
+  localAt: number;
+  centralFlags: number;
+  localFlags: number;
+  crc: number;
+  size: number;
+  /** Bit 3 is set in a header, and no descriptor stands behind the entry's data. */
+  falseDescriptor: boolean;
+}
+
+/** Is a data descriptor really at `end`? The signed form (32 or 64 bit) is its own
+ *  proof; the unsigned form has to repeat the central directory's values exactly. */
+function descriptorAt(buf: Buffer, end: number, limit: number, crc: number, compressed: number, size: number): boolean {
+  if (end + 4 > limit) return false;
+  if (buf.readUInt32LE(end) === SIG_DESCRIPTOR) return true;
+  return end + 12 <= limit
+    && buf.readUInt32LE(end) === crc
+    && buf.readUInt32LE(end + 4) === compressed
+    && buf.readUInt32LE(end + 8) === size;
+}
+
 /**
- * Clear the "data descriptor present" flag on entries that do not have one.
+ * Walk the central directory and each local header.
  *
- * LibreOffice (and anything else that streams a zip) sets general-purpose bit 3
- * and appends a descriptor after each entry. adm-zip re-writes such an archive
- * with real sizes and CRCs in the headers but WITHOUT the descriptor — while
- * faithfully copying the flag that promises one. The result is a perfectly valid
- * zip by every other reader (`unzip -t` passes, Word opens it) that adm-zip's own
- * reader then refuses with "No descriptor present".
- *
- * That matters here because the server re-opens its own output on the next edit:
- * one save of a LibreOffice-authored upload was enough to make every later AI
- * edit of that thesis fail to load. Clearing the lying flag is a two-byte fix per
- * entry, and it makes the bytes describe what is actually in the file.
- *
- * Bails out untouched on anything unexpected (Zip64, truncated directory, a
- * local header that doesn't line up) — a half-rewritten zip is far worse than an
- * unhelpful one.
+ * Null on anything unexpected (Zip64, truncated directory, a local header that
+ * doesn't line up, or a flagged entry with no descriptor whose local header
+ * disagrees with the directory, since then the file's real values are unknown).
+ * A half-understood zip is reported on by nobody and rewritten by nobody.
  */
-export function clearFalseDataDescriptors(buffer: Buffer): Buffer {
+function readZipEntries(buffer: Buffer): ZipEntryFacts[] | null {
   // The EOCD sits at the end, after an optional comment of up to 64 KB.
   const scanFrom = Math.max(0, buffer.length - (0xffff + 22));
   let eocd = -1;
   for (let i = buffer.length - 22; i >= scanFrom; i--) {
     if (buffer.readUInt32LE(i) === SIG_EOCD) { eocd = i; break; }
   }
-  if (eocd === -1) return buffer;
+  if (eocd === -1) return null;
 
   const count = buffer.readUInt16LE(eocd + 10);
   const dirOffset = buffer.readUInt32LE(eocd + 16);
-  // 0xFFFF/0xFFFFFFFF are Zip64 escapes — out of scope, leave it alone.
-  if (count === 0xffff || dirOffset === 0xffffffff || dirOffset >= buffer.length) return buffer;
+  // 0xFFFF/0xFFFFFFFF are Zip64 escapes: out of scope.
+  if (count === 0xffff || dirOffset === 0xffffffff || dirOffset >= buffer.length) return null;
 
-  const out = Buffer.from(buffer);
+  const entries: ZipEntryFacts[] = [];
   let p = dirOffset;
-  let cleared = 0;
-
   for (let n = 0; n < count; n++) {
-    if (p + 46 > out.length || out.readUInt32LE(p) !== SIG_CENTRAL) return buffer;
-    const flags = out.readUInt16LE(p + 8);
-    const crc = out.readUInt32LE(p + 16);
-    const localAt = out.readUInt32LE(p + 42);
-    const nameLen = out.readUInt16LE(p + 28);
-    const extraLen = out.readUInt16LE(p + 30);
-    const commentLen = out.readUInt16LE(p + 32);
+    if (p + 46 > buffer.length || buffer.readUInt32LE(p) !== SIG_CENTRAL) return null;
+    const centralFlags = buffer.readUInt16LE(p + 8);
+    const crc = buffer.readUInt32LE(p + 16);
+    const compressed = buffer.readUInt32LE(p + 20);
+    const size = buffer.readUInt32LE(p + 24);
+    const nameLen = buffer.readUInt16LE(p + 28);
+    const extraLen = buffer.readUInt16LE(p + 30);
+    const commentLen = buffer.readUInt16LE(p + 32);
+    const localAt = buffer.readUInt32LE(p + 42);
+    if (compressed === 0xffffffff || size === 0xffffffff || localAt === 0xffffffff) return null;
+    if (p + 46 + nameLen > buffer.length) return null;
+    if (localAt + 30 > buffer.length || buffer.readUInt32LE(localAt) !== SIG_LOCAL) return null;
 
-    // Only touch an entry that claims a descriptor while carrying a real CRC —
-    // i.e. one where the promise is demonstrably false.
-    if ((flags & FLAG_DATA_DESCRIPTOR) !== 0 && crc !== 0 && localAt !== 0xffffffff) {
-      if (localAt + 30 > out.length || out.readUInt32LE(localAt) !== SIG_LOCAL) return buffer;
-      if (out.readUInt32LE(localAt + 14) !== crc) return buffer; // local header disagrees — don't guess
-      out.writeUInt16LE(flags & ~FLAG_DATA_DESCRIPTOR, p + 8);
-      out.writeUInt16LE(out.readUInt16LE(localAt + 6) & ~FLAG_DATA_DESCRIPTOR, localAt + 6);
-      cleared++;
+    const localFlags = buffer.readUInt16LE(localAt + 6);
+    let falseDescriptor = false;
+    if ((centralFlags | localFlags) & FLAG_DATA_DESCRIPTOR) {
+      const dataEnd = localAt + 30 + buffer.readUInt16LE(localAt + 26) + buffer.readUInt16LE(localAt + 28) + compressed;
+      if (!descriptorAt(buffer, dataEnd, dirOffset, crc, compressed, size)) {
+        // No descriptor, so the local header has to carry the real values itself.
+        if (buffer.readUInt32LE(localAt + 14) !== crc
+          || buffer.readUInt32LE(localAt + 18) !== compressed
+          || buffer.readUInt32LE(localAt + 22) !== size) return null;
+        falseDescriptor = true;
+      }
     }
+
+    entries.push({
+      name: buffer.toString("utf8", p + 46, p + 46 + nameLen),
+      centralAt: p,
+      localAt,
+      centralFlags,
+      localFlags,
+      crc,
+      size,
+      falseDescriptor,
+    });
     p += 46 + nameLen + extraLen + commentLen;
   }
-
-  return cleared ? out : buffer;
+  return entries;
 }
 
-/** Open a .docx from bytes, healing the zip-level flag first so adm-zip can
- *  actually read a package it produced itself. A plain ZipManager on purpose:
- *  the doctor only ever needs the parts, and constructing a full Mdocxengine
- *  runs every PartsManager — one of which throws on exactly the malformed
- *  packages this module exists to diagnose. */
-async function openBuffer(buffer: Buffer): Promise<DocxZip> {
-  try {
-    return (await ZipManager.loadFromBuffer(buffer)) as unknown as DocxZip;
-  } catch {
-    return (await ZipManager.loadFromBuffer(clearFalseDataDescriptors(buffer))) as unknown as DocxZip;
+/** What a package's own zip headers get wrong, by entry name. */
+export interface ZipFlagReport {
+  /** Non-empty entries whose local header promises a descriptor that is not there.
+   *  Word refuses the whole file, even when it is a single entry. */
+  falseDescriptors: string[];
+  /** The same false promise where Word reads past it: an empty entry (a directory,
+   *  a zero-length file), or a flag standing only in the central directory. */
+  toleratedFalseDescriptors: string[];
+  /** Non-empty entries that record CRC 0. Word opens them; adm-zip and `unzip -t`
+   *  do not. Reported only: no flag explains it, so nothing here can repair it. */
+  zeroCrc: string[];
+}
+
+/**
+ * Read a package's zip flags without touching it. Null when the zip can't be
+ * walked (see `readZipEntries`). `clearFalseDataDescriptors` clears exactly the
+ * two descriptor lists, so what this names is what a repair clears.
+ */
+export function inspectZipFlags(buffer: Buffer): ZipFlagReport | null {
+  const entries = readZipEntries(buffer);
+  if (!entries) return null;
+  const report: ZipFlagReport = { falseDescriptors: [], toleratedFalseDescriptors: [], zeroCrc: [] };
+  for (const e of entries) {
+    if (e.size > 0 && e.crc === 0) report.zeroCrc.push(e.name);
+    if (!e.falseDescriptor) continue;
+    if (e.size > 0 && (e.localFlags & FLAG_DATA_DESCRIPTOR)) report.falseDescriptors.push(e.name);
+    else report.toleratedFalseDescriptors.push(e.name);
   }
+  return report;
 }
 
-/** Check a .docx held as bytes. Read-only — the buffer is never modified. */
+/**
+ * Clear the "data descriptor present" flag on entries that do not have one.
+ *
+ * LibreOffice (and anything else that streams a zip) sets general-purpose bit 3
+ * and appends a descriptor after each entry. adm-zip re-writes such an archive
+ * with real sizes and CRCs in the headers but WITHOUT the descriptor, while
+ * faithfully copying the flag that promises one. `unzip -t` still passes, but
+ * real Word refuses the file (-10000, even with one such entry; measured on Word
+ * for Mac), and adm-zip's own reader throws "No descriptor present".
+ *
+ * That matters here because the server re-opens its own output on the next edit:
+ * one save of a LibreOffice-authored upload was enough to make every later AI
+ * edit of that thesis fail to load. Clearing the lying flag is a two-byte fix per
+ * entry, and it makes the bytes describe what is actually in the file.
+ *
+ * Each entry is judged on its own evidence: is there a descriptor behind its
+ * data? So a truly streamed archive comes back as the same buffer, and so does
+ * anything `readZipEntries` won't vouch for. A CRC of 0 proves nothing either
+ * way: directories and empty files carry one legitimately, and they lose a false
+ * flag like any other entry. Never mutates its input.
+ */
+export function clearFalseDataDescriptors(buffer: Buffer): Buffer {
+  const lying = (readZipEntries(buffer) ?? []).filter((e) => e.falseDescriptor);
+  if (!lying.length) return buffer;
+  const out = Buffer.from(buffer);
+  for (const e of lying) {
+    out.writeUInt16LE(e.centralFlags & ~FLAG_DATA_DESCRIPTOR, e.centralAt + 8);
+    out.writeUInt16LE(e.localFlags & ~FLAG_DATA_DESCRIPTOR, e.localAt + 6);
+  }
+  return out;
+}
+
+/** The report's findings for a zip's flags; `cleared` when a repair removed the false ones. */
+function zipFindings(flags: ZipFlagReport | null, cleared: boolean): Finding[] {
+  if (!flags) return [];
+  const out: Finding[] = [];
+  if (flags.falseDescriptors.length) {
+    out.push(finding({
+      rule: "zip.false-data-descriptor",
+      severity: "fatal",
+      part: "package",
+      count: flags.falseDescriptors.length,
+      message: `${flags.falseDescriptors.length} zip entr${flags.falseDescriptors.length === 1 ? "y promises" : "ies promise"} a data descriptor that is not there. Word refuses the whole file. Clearing the flag repairs it without touching any content.`,
+      detail: sample(flags.falseDescriptors),
+      fixable: true,
+      fixed: cleared,
+    }));
+  }
+  if (flags.toleratedFalseDescriptors.length) {
+    out.push(finding({
+      rule: "zip.false-data-descriptor-tolerated",
+      severity: "warning",
+      part: "package",
+      count: flags.toleratedFalseDescriptors.length,
+      message: `${flags.toleratedFalseDescriptors.length} zip entr${flags.toleratedFalseDescriptors.length === 1 ? "y promises" : "ies promise"} a data descriptor that is not there, on an empty entry or in the central directory only. Word reads past it, but stricter readers may not.`,
+      detail: sample(flags.toleratedFalseDescriptors),
+      fixable: true,
+      fixed: cleared,
+    }));
+  }
+  if (flags.zeroCrc.length) {
+    out.push(finding({
+      rule: "zip.crc-zero",
+      severity: "warning",
+      part: "package",
+      count: flags.zeroCrc.length,
+      message: `${flags.zeroCrc.length} zip entr${flags.zeroCrc.length === 1 ? "y records" : "ies record"} a checksum of 0 despite having content. Word opens the file, but unzip and this engine's own reader refuse those entries.`,
+      detail: sample(flags.zeroCrc),
+      fixable: false,
+    }));
+  }
+  return out;
+}
+
+/** A report with the zip's findings merged in, in the usual order, with `ok` restated. */
+function withZipFindings<T extends DoctorReport>(report: T, extra: Finding[]): T {
+  if (!extra.length) return report;
+  const findings = [...report.findings, ...extra]
+    .sort((a, b) => (SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]) || a.part.localeCompare(b.part));
+  return { ...report, findings, ok: !findings.some((f) => f.severity === "fatal" && !f.fixed) };
+}
+
+/** Open a .docx from bytes, healing the zip-level flag FIRST. adm-zip throws when a
+ *  flagged entry is READ, not when the zip is opened, and `readPart` takes a throw
+ *  for an absent part, so a healed copy is what makes every check below see the
+ *  document at all. A plain ZipManager on purpose: the doctor only ever needs the
+ *  parts, and constructing a full Mdocxengine runs every PartsManager, one of which
+ *  throws on exactly the malformed packages this module exists to diagnose. */
+async function openBuffer(buffer: Buffer): Promise<DocxZip> {
+  return (await ZipManager.loadFromBuffer(clearFalseDataDescriptors(buffer))) as unknown as DocxZip;
+}
+
+/** Check a .docx held as bytes. Read-only: the buffer is never modified. */
 export async function checkDocxBuffer(buffer: Buffer): Promise<DoctorReport> {
-  return inspectDocx(await openBuffer(buffer));
+  const report = inspectDocx(await openBuffer(buffer));
+  return withZipFindings(report, zipFindings(inspectZipFlags(buffer), false));
 }
 
 export interface RepairResult extends DoctorReport {
@@ -1790,18 +1932,28 @@ export interface RepairResult extends DoctorReport {
  * somehow left a part unreadable, or turned a clean fatal into a new one, the
  * whole thing is discarded and the original bytes are returned. A doctor that
  * can corrupt a thesis is worse than no doctor.
+ *
+ * Zip flags are repaired too, and stay on the report as fixed `zip.*` findings.
+ * `repairedParts` keeps its meaning, parts rewritten: clearing a flag rewrites
+ * none, so go by `changed` for whether the bytes moved.
  */
 export async function repairDocxBuffer(
   buffer: Buffer,
   opts: { aggressive?: boolean } = {},
 ): Promise<RepairResult> {
-  const zip = await openBuffer(buffer);
+  const flags = inspectZipFlags(buffer);
+  const healed = clearFalseDataDescriptors(buffer);
+  const flagsCleared = healed !== buffer;
+
+  const zip = await openBuffer(healed);
   const report = inspectDocx(zip, { fix: true, aggressive: opts.aggressive });
-  if (!report.repairedParts.length) return { ...report, buffer, changed: false };
+  if (!report.repairedParts.length) {
+    return { ...withZipFindings(report, zipFindings(flags, flagsCleared)), buffer: healed, changed: flagsCleared };
+  }
 
   /** Give up on the repair and hand back exactly what we were given. */
   const abandon = async (why: string): Promise<RepairResult> => {
-    const original = inspectDocx(await openBuffer(buffer));
+    const original = await checkDocxBuffer(buffer);
     original.findings.push(finding({
       rule: "repair.abandoned",
       severity: "warning",
@@ -1830,7 +1982,12 @@ export async function repairDocxBuffer(
     const fatalsAfter = after.findings.filter((f) => f.severity === "fatal").length;
     if (fatalsAfter > fatalsBefore) return abandon("it would have introduced a new problem");
 
-    return { ...after, repairedParts: report.repairedParts, buffer: repaired, changed: true };
+    return {
+      ...withZipFindings(after, zipFindings(flags, flagsCleared)),
+      repairedParts: report.repairedParts,
+      buffer: repaired,
+      changed: true,
+    };
   } catch (e) {
     return abandon(e instanceof Error ? e.message : String(e));
   }

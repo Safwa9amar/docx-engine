@@ -489,6 +489,7 @@ export {
   checkDocxBuffer,
   repairDocxBuffer,
   clearFalseDataDescriptors,
+  inspectZipFlags,
   firstXmlError,
   summarize,
 } from "./doctor/index";
@@ -498,5 +499,6 @@ export type {
   Severity,
   DocxZip,
   InspectOptions,
+  ZipFlagReport,
   RepairResult,
 } from "./doctor/index";
