@@ -1446,6 +1446,20 @@ function checkReferences(zip: DocxZip, names: string[], present: Set<string>): F
         fixable: false,
       }));
     }
+
+    const bullets = new Set([...numbering.matchAll(/<w:numPicBullet\b[^>]*\bw:numPicBulletId="([^"]*)"/g)].map((m) => m[1]));
+    const noBullet = new Set([...numbering.matchAll(/<w:lvlPicBulletId\b[^>]*\bw:val="([^"]*)"/g)].map((m) => m[1]).filter((id) => !bullets.has(id)));
+    if (noBullet.size) {
+      out.push(finding({
+        rule: "ref.unknown-pic-bullet",
+        severity: "fatal",
+        part: "word/numbering.xml",
+        count: noBullet.size,
+        message: `${noBullet.size} list level(s) name a picture bullet the numbering part does not define. Word refuses the whole file.`,
+        detail: sample(noBullet),
+        fixable: false,
+      }));
+    }
   }
 
   return out;
@@ -1894,6 +1908,35 @@ function zipFindings(flags: ZipFlagReport | null, cleared: boolean): Finding[] {
   return out;
 }
 
+/**
+ * A part the package names that cannot be read. `readPart` takes a throw for an absent part, so every
+ * check passes over such a part and the report would say the document is fine, while Word refuses it
+ * (a flag with no descriptor over a local header that disagrees, damaged data). A CRC-0 entry is left
+ * to its own finding: Word opens those. Binary parts are not read: this runs on every save.
+ */
+function unreadableFindings(zip: DocxZip, flags: ZipFlagReport | null): Finding[] {
+  const unreadable: string[] = [];
+  for (const { entryName } of zip.getEntries()) {
+    if (!/\.(?:xml|rels)$/i.test(entryName) || flags?.zeroCrc.includes(entryName)) continue;
+    try {
+      zip.readAsText(entryName);
+    } catch {
+      unreadable.push(entryName);
+    }
+  }
+  if (!unreadable.length) return [];
+  return [finding({
+    rule: "zip.unreadable-part",
+    severity: "fatal",
+    part: "package",
+    count: unreadable.length,
+    message: `${unreadable.length} part${unreadable.length === 1 ? "" : "s"} of the package cannot be read, so none of them could be checked. Word is expected to refuse the file.`,
+    detail: sample(unreadable),
+    fixable: false,
+    fixed: false,
+  })];
+}
+
 /** A report with the zip's findings merged in, in the usual order, with `ok` restated. */
 function withZipFindings<T extends DoctorReport>(report: T, extra: Finding[]): T {
   if (!extra.length) return report;
@@ -1914,8 +1957,9 @@ async function openBuffer(buffer: Buffer): Promise<DocxZip> {
 
 /** Check a .docx held as bytes. Read-only: the buffer is never modified. */
 export async function checkDocxBuffer(buffer: Buffer): Promise<DoctorReport> {
-  const report = inspectDocx(await openBuffer(buffer));
-  return withZipFindings(report, zipFindings(inspectZipFlags(buffer), false));
+  const zip = await openBuffer(buffer);
+  const flags = inspectZipFlags(buffer);
+  return withZipFindings(inspectDocx(zip), [...zipFindings(flags, false), ...unreadableFindings(zip, flags)]);
 }
 
 export interface RepairResult extends DoctorReport {
@@ -1947,8 +1991,9 @@ export async function repairDocxBuffer(
 
   const zip = await openBuffer(healed);
   const report = inspectDocx(zip, { fix: true, aggressive: opts.aggressive });
+  const packageFindings = [...zipFindings(flags, flagsCleared), ...unreadableFindings(zip, flags)];
   if (!report.repairedParts.length) {
-    return { ...withZipFindings(report, zipFindings(flags, flagsCleared)), buffer: healed, changed: flagsCleared };
+    return { ...withZipFindings(report, packageFindings), buffer: healed, changed: flagsCleared };
   }
 
   /** Give up on the repair and hand back exactly what we were given. */
@@ -1983,7 +2028,7 @@ export async function repairDocxBuffer(
     if (fatalsAfter > fatalsBefore) return abandon("it would have introduced a new problem");
 
     return {
-      ...withZipFindings(after, zipFindings(flags, flagsCleared)),
+      ...withZipFindings(after, packageFindings),
       repairedParts: report.repairedParts,
       buffer: repaired,
       changed: true,

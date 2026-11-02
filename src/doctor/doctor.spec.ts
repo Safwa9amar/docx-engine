@@ -396,6 +396,16 @@ describe("docx-doctor: references", () => {
     expect(findRule(zip, "ref.unknown-style")).toMatchObject({ severity: "warning", detail: "Ghost" });
   });
 
+  describe("what Word refuses the whole file for", () => {
+    const fatal = (z: DocxZip, rule: string) => inspectDocx(z).findings.find((f) => f.rule === rule && f.severity === "fatal");
+
+    it("a list level naming a picture bullet that is not there", () => {
+      const num = (inner: string) => `<w:numbering ${NS}>${inner}<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:lvlPicBulletId w:val="3"/></w:lvl></w:abstractNum></w:numbering>`;
+      expect(fatal(pkg(P() + SECT, { "word/numbering.xml": num("") }), "ref.unknown-pic-bullet")).toMatchObject({ count: 1, fixable: false });
+      expect(rulesOf(pkg(P() + SECT, { "word/numbering.xml": num('<w:numPicBullet w:numPicBulletId="3"><w:pict/></w:numPicBullet>') }))).not.toContain("ref.unknown-pic-bullet");
+    });
+  });
+
   it("treats numId 0 as legal (it means 'no numbering')", () => {
     const body = `<w:p><w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr></w:p>${SECT}`;
     const zip = pkg(body, { "word/numbering.xml": `<w:numbering ${NS}/>` });
@@ -796,6 +806,48 @@ describe("docx-doctor: the package's own zip flags", () => {
     expect(r.changed).toBe(true);
     expect(ruleOf(r, "zip.false-data-descriptor-tolerated")).toMatchObject({ count: 2, fixed: true });
     expect(bit3Everywhere(r.buffer)).toEqual([]);
+  });
+
+  it("a part nothing can read is fatal: a flag with no descriptor over a header that disagrees", async () => {
+    const buf = forgeBit3(pkg(P() + SECT).toBuffer());
+    const e = zipOffsets(buf).find((x) => x.name === "word/document.xml")!;
+    buf.writeUInt32LE((buf.readUInt32LE(e.local + 14) ^ 1) >>> 0, e.local + 14);
+    const report = await checkDocxBuffer(buf);
+    expect(report.ok).toBe(false);
+    expect(ruleOf(report, "zip.unreadable-part")).toMatchObject({ severity: "fatal", fixable: false });
+    expect(ruleOf(report, "zip.unreadable-part").detail).toContain("word/document.xml");
+    const r = await repairDocxBuffer(buf);
+    expect(r.ok).toBe(false);
+    expect(r.buffer).toBe(buf);
+    expect(ruleOf(r, "zip.unreadable-part")).toMatchObject({ fixed: false });
+  });
+
+  it("damaged compressed data is the same fault", async () => {
+    const zip = new AdmZip();
+    for (const [name, xml] of Object.entries(PKG_PARTS())) zip.addFile(name, Buffer.from(xml.repeat(40), "utf8"));
+    const buf = Buffer.from(zip.toBuffer());
+    const e = zipOffsets(buf).find((x) => x.name === "word/document.xml")!;
+    const dataAt = e.local + 30 + buf.readUInt16LE(e.local + 26) + buf.readUInt16LE(e.local + 28);
+    for (let i = 8; i < 24; i++) buf[dataAt + i] ^= 0xff;
+    const report = await checkDocxBuffer(buf);
+    expect(report.ok).toBe(false);
+    expect(ruleOf(report, "zip.unreadable-part")).toBeDefined();
+  });
+
+  it("a healthy package, a streamed one and a healed false flag have no unreadable part", async () => {
+    for (const b of [pkg(P() + SECT).toBuffer(), streamedZip(PKG_PARTS()), forgeBit3(pkg(P() + SECT).toBuffer())]) {
+      expect(ruleOf(await checkDocxBuffer(b), "zip.unreadable-part")).toBeUndefined();
+    }
+  });
+
+  it("a CRC-0 part stays a warning: Word opens it, whatever this engine's reader says", async () => {
+    const buf = Buffer.from(pkg(P() + SECT).toBuffer());
+    const e = zipOffsets(buf).find((x) => x.name === "_rels/.rels")!;
+    buf.writeUInt32LE(0, e.local + 14);
+    buf.writeUInt32LE(0, e.central + 16);
+    const report = await checkDocxBuffer(buf);
+    expect(ruleOf(report, "zip.crc-zero")).toBeDefined();
+    expect(ruleOf(report, "zip.unreadable-part")).toBeUndefined();
   });
 
   it("a CRC-0 entry is flagged, not fixable, and repair leaves it alone", async () => {
