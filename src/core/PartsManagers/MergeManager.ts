@@ -15,9 +15,8 @@
  *   - comments → NOT copied. Their anchors are stripped and counted: a thesis going
  *                to deposit never carries them, and a `w:commentReference` left with
  *                no comments part behind it makes Word refuse the file.
- *   - styles   → retargeted to this document's styles by name (caller-supplied
- *                map); the combine flow normalizes everything to one profile, so
- *                source style DEFINITIONS are intentionally not imported.
+ *   - styles   → reconciled by NAME, Word's own identity for a style: see mergeStyles.ts.
+ *                A caller's styleMap (the combine flow normalizes to one profile) outranks it.
  *   - charts   → the chart part and its whole closure (colours, style, embedded
  *                workbook) copied into word/charts + word/embeddings, with a new
  *                rId. A `<c:chart r:id>` addresses a PART, so copying only the
@@ -32,18 +31,22 @@
 import AdmZip from "adm-zip";
 import DocumentManager from "./DocumentManager";
 import { MediaManager } from "./MediaManager";
-import { FootnoteManager } from "./FootnoteManager";
+import { FootnoteManager, SEPARATOR_NOTE_TYPE } from "./FootnoteManager";
 import { EndnoteManager } from "./EndnoteManager";
-import { NumberingManager } from "./NumberingManager";
+import { NumberingManager, type RawNumbering } from "./NumberingManager";
 import { RelManager } from "./RelManager";
 import { ContentTypesManager } from "./ContentTypesManager";
+import { SettingsManager } from "./SettingsManager";
+import { planStyles, retargetListRefs, retargetStyleRefs, stampNumbering, type StylePlan } from "./mergeStyles";
 import { parseXml } from "@/utils/xmlUtils";
 import { carryRootNamespaces } from "@/utils/rootNamespaces";
-import type { BodyBlock } from "@/core/files/body/OrderedBody";
+import { assembleDocument, splitDocument, type BodyBlock } from "@/core/files/body/OrderedBody";
+import { clearFalseDataDescriptors } from "@/doctor";
 // Imported lazily inside appendDocument() to avoid an index.ts ↔ MergeManager cycle.
 import type { Mdocxengine as MdocxengineType } from "@/index";
 
 const SRC_RELS_PATH = "word/_rels/document.xml.rels";
+const NUMBERING_RELS_PATH = "word/_rels/numbering.xml.rels";
 const PAGE_BREAK_XML = '<w:p><w:r><w:br w:type="page"/></w:r></w:p>';
 
 function pageBreakBlock(): BodyBlock {
@@ -97,6 +100,8 @@ function partRelsPath(part: string): string {
   return `${part.slice(0, i)}/_rels/${part.slice(i + 1)}.rels`;
 }
 
+const asArray = <T>(x: T | T[] | undefined | null): T[] => (Array.isArray(x) ? x : x == null ? [] : [x]);
+
 type NoteKind = "footnote" | "endnote";
 const NOTE_KINDS: NoteKind[] = ["footnote", "endnote"];
 
@@ -105,19 +110,158 @@ function noteRefIds(xml: string, kind: NoteKind): Set<string> {
   return new Set([...xml.matchAll(new RegExp(`<w:${kind}Reference\\b[^>]*\\bw:id="([^"]+)"`, "g"))].map((m) => m[1]));
 }
 
+/** A note's own separators, by what its open tag says it is. */
+const separatorNotes = (kind: NoteKind) =>
+  new RegExp(`<w:${kind}\\b(?=[^>]*\\bw:type="(?:separator|continuationSeparator|continuationNotice)")[^>]*?(?:/>|>[\\s\\S]*?</w:${kind}>)`, "g");
+
+const NOTE_PROPS = ["pos", "numFmt", "numStart", "numRestart"];
+/** Word's values for what no setting names. */
+const NOTE_PROP_DEFAULTS: Record<NoteKind, Record<string, string>> = {
+  footnote: { pos: "pageBottom", numFmt: "decimal", numRestart: "continuous" },
+  endnote: { pos: "docEnd", numFmt: "lowerRoman", numRestart: "continuous" },
+};
+
+/** The first `w:footnotePr` or `w:endnotePr` of a settings part or a section, as XML. */
+function notePr(xml: string | null | undefined, kind: NoteKind): string | null {
+  return new RegExp(`<w:${kind}Pr\\b[^>]*?(?:/>|>[\\s\\S]*?</w:${kind}Pr>)`).exec((xml ?? "").split("<w:sectPrChange")[0])?.[0] ?? null;
+}
+
+/** The numbering and placement a note property element states, as XML and by name. */
+function noteProps(element: string | null): { xml: string; byName: Record<string, string> } {
+  const byName: Record<string, string> = {};
+  let xml = "";
+  for (const m of (element ?? "").matchAll(new RegExp(`<w:(${NOTE_PROPS.join("|")})\\b[^>]*?(?:/>|>\\s*</w:\\1>)`, "g"))) {
+    xml += m[0];
+    const value = /\bw:val="([^"]*)"/.exec(m[0])?.[1] ?? "";
+    const format = /\bw:format="([^"]*)"/.exec(m[0])?.[1];
+    byName[m[1]] = format ? `${value} ${format}` : value;
+  }
+  return { xml, byName };
+}
+
+/** The separator list a `w:footnotePr` of a settings part holds. */
+function noteSeparatorRefs(element: string | null, kind: NoteKind): string {
+  return (element ?? "").match(new RegExp(`<w:${kind}\\b[^>]*?(?:/>|>[\\s\\S]*?</w:${kind}>)`, "g"))?.join("") ?? "";
+}
+
+/** What numbers and places a document's notes in its final section. A start value is left out:
+ *  a part set to start at 31 is carrying on from the file before it, which a merge does anyway. */
+function effectiveNoteProps(kind: NoteKind, settings: string | null | undefined, finalSect: string | null): Record<string, string> {
+  const { numStart: _a, ...fromSettings } = noteProps(notePr(settings, kind)).byName;
+  const { numStart: _b, ...fromSection } = noteProps(notePr(finalSect, kind)).byName;
+  return { ...NOTE_PROP_DEFAULTS[kind], ...fromSettings, ...fromSection };
+}
+
+/** The final section of a document, as XML. */
+function finalSectPr(documentXml: string): string | null {
+  return documentXml ? (splitDocument(documentXml).blocks.filter((b) => b.kind === "sectPr").pop()?.xml ?? null) : null;
+}
+
+/** A section with this kind's note properties replaced, in `CT_SectPr` order. */
+function withNotePr(sect: string, kind: NoteKind, element: string | null): string {
+  const open = /^<w:sectPr\b[^>]*?(\/?)>/.exec(sect);
+  if (!open) return sect;
+  if (open[1]) return element ? `${open[0].slice(0, -2).trimEnd()}>${element}</w:sectPr>` : sect;
+  const change = sect.indexOf("<w:sectPrChange");
+  const head = change === -1 ? sect : sect.slice(0, change);
+  const tail = change === -1 ? "" : sect.slice(change);
+  const bare = head.replace(new RegExp(`\\s*<w:${kind}Pr\\b[^>]*?(?:/>|>[\\s\\S]*?</w:${kind}Pr>)`), "");
+  if (!element) return bare + tail;
+  const earlier = kind === "footnote" ? "headerReference|footerReference" : "headerReference|footerReference|footnotePr";
+  const skip = new RegExp(`\\s*<w:(${earlier})\\b[^>]*?(?:/>|>[\\s\\S]*?</w:\\1>)`, "y");
+  let at = open[0].length;
+  skip.lastIndex = at;
+  while (skip.exec(bare)) at = skip.lastIndex;
+  return bare.slice(0, at) + element + bare.slice(at) + tail;
+}
+
+/**
+ * Run `fix` over each field code as one string. Word splits a code across runs wherever it likes,
+ * so a name can stand in two `w:instrText`. A changed code goes whole into the first piece; the
+ * other pieces stay, empty. A nested field's code is its own.
+ */
+function rewriteFieldCodes(xml: string, fix: (code: string) => string): string {
+  if (!xml.includes("<w:instrText")) return xml;
+  type Piece = { start: number; end: number; open: string; text: string; close: string };
+  const token = /<w:fldChar\b[^>]*\bw:fldCharType="(begin|separate|end)"[^>]*?(?:\/>|>[\s\S]*?<\/w:fldChar>)|(<w:instrText\b[^>]*?(?<!\/)>)([^<]*)(<\/w:instrText>)/g;
+  const edits: { start: number; end: number; xml: string }[] = [];
+  const settle = (pieces: Piece[]) => {
+    if (!pieces.length) return;
+    const whole = pieces.map((p) => p.text).join("");
+    const fixed = fix(whole);
+    if (fixed === whole) return;
+    pieces.forEach((p, i) => {
+      const open = i === 0 && !/\bxml:space=/.test(p.open) ? p.open.replace(/>$/, ' xml:space="preserve">') : p.open;
+      edits.push({ start: p.start, end: p.end, xml: open + (i === 0 ? fixed : "") + p.close });
+    });
+  };
+  const open: Piece[][] = [];
+  for (const m of xml.matchAll(token)) {
+    if (m[1] === "begin") open.push([]);
+    else if (m[1] === "separate" || m[1] === "end") {
+      const top = open[open.length - 1];
+      if (top) {
+        settle(top);
+        top.length = 0;
+      }
+      if (m[1] === "end") open.pop();
+    } else {
+      const piece = { start: m.index!, end: m.index! + m[0].length, open: m[2], text: m[3], close: m[4] };
+      const top = open[open.length - 1];
+      if (top) top.push(piece);
+      else settle([piece]);
+    }
+  }
+  open.forEach(settle);
+  let out = xml;
+  for (const e of edits.sort((a, b) => b.start - a.start)) out = out.slice(0, e.start) + e.xml + out.slice(e.end);
+  return out;
+}
+
+/** Elements whose relationship attributes have a path of their own, or which a merge removes. */
+const REL_OWN_PATH = new Set([
+  "w:hyperlink", "c:chart", "v:imagedata", "v:fill", "o:OLEObject", "w:headerReference", "w:footerReference", "w:printerSettings",
+]);
+const ANY_OPEN_TAG = /<([\w.-]+:[\w.-]+)\b[^>]*>/g;
+/** `r:embed` and `r:link` are the media path's, whatever element holds them. */
+const OTHER_REL_ATTR = /\s(r:(?!embed\b|link\b)[a-zA-Z]+|o:relid)="([^"]+)"/g;
+
+const safeDecode = (s: string) => {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+};
+
 // ─── Comment markup ─────────────────────────────────────────────────────────
 
 const COMMENT_MARK_ID = /<w:comment(?:RangeStart|RangeEnd|Reference)\b[^>]*\bw:id="([^"]*)"/g;
-/** A run that holds the reference and nothing else (an rPr aside) goes with it. */
+/**
+ * A run that holds the reference and nothing else (an rPr aside) goes with it. `(?<!\/)` keeps
+ * a self-closed tag (`<w:rPr />`, the form .NET's XmlWriter gives an empty element) from being
+ * read as an opening one, which would run the removal on through the student's words.
+ */
 const COMMENT_ONLY_RUN =
-  /<w:r(?:\s[^>]*)?>\s*(?:<w:rPr(?:\s[^>]*)?\/>|<w:rPr(?:\s[^>]*)?>(?:(?!<\/w:rPr>)[\s\S])*<\/w:rPr>)?\s*<w:commentReference\b[^>]*?(?:\/>|>\s*<\/w:commentReference>)\s*<\/w:r>/g;
+  /<w:r(?:\s[^>]*?)?(?<!\/)>\s*(?:<w:rPr(?:\s[^>]*?)?\/>|<w:rPr(?:\s[^>]*?)?(?<!\/)>(?:(?!<\/w:rPr>)[\s\S])*<\/w:rPr>)?\s*<w:commentReference\b[^>]*?(?:\/>|>\s*<\/w:commentReference>)\s*<\/w:r>/g;
 const COMMENT_MARK = /<w:comment(RangeStart|RangeEnd|Reference)\b[^>]*?(?:\/>|>\s*<\/w:comment\1>)/g;
+/** What a comment anchor can never hold: words and the elements around them. */
+const COMMENT_FREE_CONTENT = /<w:t(?:\s[^>]*)?>[^<]*<\/w:t>|<\/?w:(?:p|tc|tr|tbl|hyperlink|footnote|endnote)(?=[\s>\/])/g;
+const commentFreeContent = (xml: string) => (xml.match(COMMENT_FREE_CONTENT) ?? []).join("");
 
-/** `xml` with every comment anchor gone, nothing else changed; their ids land in `ids`. */
+/**
+ * `xml` with every comment anchor gone, nothing else changed; their ids land in `ids`. A removal
+ * that took anything else with it throws: it reaches every route, including those with no check
+ * behind them, and losing a student's words is worse than refusing the file.
+ */
 function stripCommentMarks(xml: string, ids: Set<string>): string {
   if (!xml.includes("<w:comment")) return xml;
   for (const m of xml.matchAll(COMMENT_MARK_ID)) ids.add(m[1]);
-  return xml.replace(COMMENT_ONLY_RUN, "").replace(COMMENT_MARK, "");
+  const out = xml.replace(COMMENT_ONLY_RUN, "").replace(COMMENT_MARK, "");
+  if (commentFreeContent(out) !== commentFreeContent(xml)) {
+    throw new Error("merge: removing the comment anchors would have changed the text around them");
+  }
+  return out;
 }
 
 /** Blocks with their comment anchors gone. A block that was nothing BUT an anchor (a
@@ -170,9 +314,19 @@ export interface AppendOptions {
   styleMap?: Record<string, string>;
 }
 
+/** A later part wanted its notes numbered or placed otherwise. One final section, one answer. */
+export interface NoteConflict {
+  kind: NoteKind;
+  property: string;
+  kept: string;
+  dropped: string;
+}
+
 export interface AppendResult {
   /** Comments the source carried, none of which came across. */
   commentsStripped: number;
+  /** Where the source's note properties gave way to this document's. */
+  noteConflicts: NoteConflict[];
 }
 
 /**
@@ -204,6 +358,7 @@ export class MergeManager {
   private numbering: NumberingManager;
   private rels: RelManager;
   private contentTypes: ContentTypesManager;
+  private settings: SettingsManager;
 
   constructor(zip: AdmZip) {
     this.zip = zip;
@@ -214,6 +369,7 @@ export class MergeManager {
     this.numbering = new NumberingManager(zip);
     this.rels = new RelManager(zip);
     this.contentTypes = new ContentTypesManager(zip);
+    this.settings = new SettingsManager(zip);
   }
 
   /**
@@ -224,14 +380,16 @@ export class MergeManager {
    */
   async appendDocument(sourceBuffer: Buffer, opts: AppendOptions = {}): Promise<AppendResult> {
     const { Mdocxengine } = await import("@/index");
+    // A false zip flag is a two-byte fault that makes every read of that entry throw.
     const source = (await (Mdocxengine as typeof MdocxengineType).loadFromBuffer(
-      sourceBuffer,
+      clearFalseDataDescriptors(sourceBuffer),
     )) as MdocxengineType;
 
     const commentIds = new Set<string>();
     definedCommentIds(source.zip.readAsText("word/comments.xml"), commentIds);
     const srcBlocks = stripCommentMarksFromBlocks(await source.document.getBlocks(), commentIds);
-    const remapped = await this.remapBlocks(source, srcBlocks, opts.styleMap ?? {}, commentIds);
+    const noteConflicts: NoteConflict[] = [];
+    const remapped = await this.remapBlocks(source, srcBlocks, opts.styleMap ?? {}, commentIds, noteConflicts);
 
     const existing = await this.document.getBlocks();
     const prefix: BodyBlock[] = [];
@@ -240,7 +398,7 @@ export class MergeManager {
 
     await this.document.saveBlocks([...existing, ...prefix, ...remapped]);
     this.carryNamespaces(source);
-    return { commentsStripped: commentIds.size };
+    return { commentsStripped: commentIds.size, noteConflicts };
   }
 
   // ─── Comments ───────────────────────────────────────────────────────────────
@@ -362,34 +520,50 @@ export class MergeManager {
     blocks: BodyBlock[],
     styleMap: Record<string, string>,
     commentIds: Set<string>,
+    noteConflicts: NoteConflict[],
   ): Promise<BodyBlock[]> {
     const scan = blocks.map((b) => b.xml).join("\n");
     // First, before anything is written to this document: it can refuse the source.
     const notesScan = NOTE_KINDS.map((kind) => this.neededNotesXml(source, kind, scan)).join("\n");
+    const content = scan + "\n" + notesScan;
     const srcRels = await this.readSourceRels(source);
-    const mediaMap = await this.buildMediaMap(source, srcRels, scan);
+    const carry = this.relationshipCarrier(source, srcRels);
+    const mediaMap = await this.buildMediaMap(carry, scan);
+    const otherRelMap = await this.buildOtherRelMap(carry, scan);
     const hyperlinkMap = await this.buildHyperlinkMap(srcRels, scan);
     // A note brings its own styles and lists: `FootnoteText` often appears nowhere
     // but in the notes, and undefined it renders as Normal, at body size.
-    const importedStyles = this.collectMissingStyles(source, scan + "\n" + notesScan, styleMap);
+    const sourceLists = await source.numbering.getRawDefinitions();
+    const styles = planStyles({
+      sourceStyles: source.zip.readAsText("word/styles.xml"),
+      targetStyles: this.zip.readAsText("word/styles.xml"),
+      sourceLists,
+      targetLists: await this.numbering.getRawDefinitions(),
+      styleMap,
+      contentXml: content,
+    });
     // One numbering pass over blocks, notes AND imported styles, so a list used by
     // more than one maps to the same copied definition.
-    const numberingMap = await this.buildNumberingMap(
-      source,
-      scan + "\n" + notesScan + "\n" + importedStyles.map((x) => x.xml).join("\n"),
-    );
-    this.importStyles(importedStyles, numberingMap);
+    const numberingMap = await this.buildNumberingMap(source, sourceLists, styles);
+    await this.importStyles(styles, numberingMap);
+    const ids = this.planIds(content);
     const prepareNote = (xml: string) =>
-      this.applyStyleMap(this.applyNumIdMap(stripCommentMarks(xml, commentIds), numberingMap), styleMap);
+      this.applyIdPlan(
+        retargetStyleRefs(this.applyNumIdMap(stampNumbering(stripCommentMarks(xml, commentIds), styles), numberingMap), styles),
+        ids,
+      );
+    for (const kind of NOTE_KINDS) {
+      if (noteRefIds(scan, kind).size) noteConflicts.push(...(await this.settleNoteFurniture(source, kind)));
+    }
     const footnoteMap = await this.buildNoteMap(source, "footnote", scan, prepareNote);
     const endnoteMap = await this.buildNoteMap(source, "endnote", scan, prepareNote);
     const chartMap = await this.buildChartMap(source, srcRels, scan);
     const vmlOleMap = await this.buildVmlOleMap(source, srcRels, scan);
-    const ids = this.planIds(scan);
 
     return blocks.map((b) => {
-      let xml = b.xml;
+      let xml = stampNumbering(b.xml, styles);
       xml = this.applyAttrMap(xml, ["r:embed", "r:link"], mediaMap);
+      xml = this.applyOtherRelMap(xml, otherRelMap);
       xml = this.applyHyperlinkMap(xml, hyperlinkMap);
       xml = this.applyNoteRefMap(xml, "footnote", footnoteMap);
       xml = this.applyNoteRefMap(xml, "endnote", endnoteMap);
@@ -397,7 +571,7 @@ export class MergeManager {
       xml = this.applyChartMap(xml, chartMap);
       xml = this.applyVmlOleMap(xml, vmlOleMap);
       xml = this.applyIdPlan(xml, ids);
-      xml = this.applyStyleMap(xml, styleMap);
+      xml = retargetStyleRefs(xml, styles);
       xml = this.stripSectionChrome(xml);
       return { kind: b.kind, tag: b.tag, xml };
     });
@@ -415,14 +589,18 @@ export class MergeManager {
    * missing parts). Removing them lets the section inherit the target's chrome,
    * which is the behaviour the combine flow wants anyway.
    *
+   * A section's printer settings go with them: a relationship to a binary this merge
+   * does not copy, and of no use to a deposit.
+   *
    * Everything else in the copied `sectPr` — page size, margins, break type — is
    * preserved.
    */
   private stripSectionChrome(xml: string): string {
-    if (!xml.includes("Reference")) return xml;
+    if (!xml.includes("Reference") && !xml.includes("<w:printerSettings")) return xml;
     return xml
       .replace(/<w:(?:header|footer)Reference\b[^>]*\/>/g, "")
-      .replace(/<w:(header|footer)Reference\b[^>]*>[\s\S]*?<\/w:\1Reference>/g, "");
+      .replace(/<w:(header|footer)Reference\b[^>]*>[\s\S]*?<\/w:\1Reference>/g, "")
+      .replace(/<w:printerSettings\b[^>]*?(?:\/>|>\s*<\/w:printerSettings>)/g, "");
   }
 
   // ─── Media ─────────────────────────────────────────────────────────────────
@@ -449,29 +627,89 @@ export class MergeManager {
     return map;
   }
 
-  /** Copy each image referenced by the blocks; return source-rId → new-rId. */
-  private async buildMediaMap(
+  /**
+   * What copies one source relationship here, once each: an external target stays external,
+   * a picture gets its own media part, and any other part comes with its closure, keeping its
+   * relationship type. Undefined when the source itself has nothing behind the id.
+   */
+  private relationshipCarrier(
     source: MdocxengineType,
     srcRels: Record<string, { type: string; target: string; targetMode?: string }>,
-    blocksXml: string,
-  ): Promise<Record<string, string>> {
-    const refRIds = new Set(
-      [...blocksXml.matchAll(/r:(?:embed|link)="([^"]+)"/g)].map((m) => m[1]),
-    );
-    if (refRIds.size === 0) return {};
+  ): (rId: string) => Promise<string | undefined> {
+    const carried = new Map<string, string>();
+    const copied = new Map<string, string>();
+    const carry = async (rId: string): Promise<string | undefined> => {
+      const known = carried.get(rId);
+      if (known) return known;
+      const rel = srcRels[rId];
+      if (!rel) return undefined;
+      let id: string;
+      if (rel.targetMode === "External") {
+        id = await this.rels.genId();
+        await this.rels.addRelationship(id, rel.type, rel.target, "External");
+      } else {
+        const srcPath = resolvePartPath("word/document.xml", rel.target);
+        const entry = source.zip.getEntry(srcPath) ?? source.zip.getEntry(safeDecode(srcPath));
+        if (!entry) return undefined;
+        if (/\/image$/.test(rel.type)) {
+          const ext = (/\.([a-zA-Z0-9]+)$/.exec(srcPath)?.[1] ?? "png").toLowerCase();
+          id = (await this.media.insertImage(entry.getData(), ext)).relId;
+        } else {
+          const newPath = await this.copyPartClosure(
+            source,
+            entry.entryName,
+            await this.readContentTypeOverrides(source.zip),
+            await this.readContentTypeDefaults(source.zip),
+            copied,
+          );
+          id = await this.rels.genId();
+          await this.rels.addRelationship(id, rel.type, relativePartPath("word/document.xml", newPath));
+          // SmartArt's data part names its drawing by a relationship of the DOCUMENT.
+          if (/\/diagramData$/.test(rel.type)) {
+            const data = this.zip.readAsText(newPath) ?? "";
+            const named = /(<dsp:dataModelExt\b[^>]*\brelId=")([^"]+)(")/.exec(data);
+            const drawing = named && (await carry(named[2]));
+            if (named && drawing) this.zip.addFile(newPath, Buffer.from(data.replace(named[0], named[1] + drawing + named[3]), "utf8"));
+          }
+        }
+      }
+      carried.set(rId, id);
+      return id;
+    };
+    return carry;
+  }
 
+  /** Copy what each `r:embed`/`r:link` in the blocks reaches; return source-rId → new-rId. */
+  private async buildMediaMap(carry: (rId: string) => Promise<string | undefined>, blocksXml: string): Promise<Record<string, string>> {
     const map: Record<string, string> = {};
-    for (const rId of refRIds) {
-      const target = srcRels[rId]?.target;
-      if (!target) continue; // not a media rel (or dangling)
-      const name = target.replace(/^.*\//, ""); // "media/image1.png" → "image1.png"
-      const buf = source.media.extractImage(name);
-      if (!buf) continue;
-      const ext = (/\.([a-zA-Z0-9]+)$/.exec(target)?.[1] ?? "png").toLowerCase();
-      const { relId } = await this.media.insertImage(buf, ext);
-      map[rId] = relId;
+    for (const m of new Set([...blocksXml.matchAll(/r:(?:embed|link)="([^"]+)"/g)].map((x) => x[1]))) {
+      const id = await carry(m);
+      if (id) map[m] = id;
     }
     return map;
+  }
+
+  /** Copy what every other relationship reference in the blocks reaches: a link on a picture,
+   *  SmartArt's four parts, an embedded chunk, ink. The elements in REL_OWN_PATH are handled by
+   *  their own paths or removed. */
+  private async buildOtherRelMap(carry: (rId: string) => Promise<string | undefined>, blocksXml: string): Promise<Record<string, string>> {
+    const map: Record<string, string> = {};
+    for (const tag of blocksXml.matchAll(ANY_OPEN_TAG)) {
+      if (REL_OWN_PATH.has(tag[1])) continue;
+      for (const m of tag[0].matchAll(OTHER_REL_ATTR)) {
+        if (map[m[2]]) continue;
+        const id = await carry(m[2]);
+        if (id) map[m[2]] = id;
+      }
+    }
+    return map;
+  }
+
+  private applyOtherRelMap(xml: string, idMap: Record<string, string>): string {
+    if (Object.keys(idMap).length === 0) return xml;
+    return xml.replace(ANY_OPEN_TAG, (tag, name) =>
+      REL_OWN_PATH.has(name) ? tag : tag.replace(OTHER_REL_ATTR, (full, attr, val) => (idMap[val] ? ` ${attr}="${idMap[val]}"` : full)),
+    );
   }
 
   /**
@@ -507,7 +745,7 @@ export class MergeManager {
   // reference THROWS rather than being dropped.
 
   /** Attributes on `<v:imagedata>` / `<v:fill>` (picture fill) that name a relationship. */
-  private static readonly VML_REL_ATTRS = ["r:id", "r:href", "o:relid"];
+  private static readonly VML_REL_ATTRS = ["r:id", "r:href", "r:pict", "o:relid"];
 
   /** Copy each VML image and OLE object referenced by the blocks; return
    *  source-rId → new-rId. */
@@ -568,7 +806,7 @@ export class MergeManager {
   private applyVmlOleMap(xml: string, idMap: Record<string, string>): string {
     if (Object.keys(idMap).length === 0) return xml;
     return xml.replace(/<(?:v:imagedata|v:fill|o:OLEObject)\b[^>]*>/g, (tag) =>
-      tag.replace(/\b((?:r:id|r:href|o:relid)=")([^"]+)(")/g, (full, a, val, c) =>
+      tag.replace(/\b((?:r:id|r:href|r:pict|o:relid)=")([^"]+)(")/g, (full, a, val, c) =>
         idMap[val] ? `${a}${idMap[val]}${c}` : full,
       ),
     );
@@ -578,54 +816,27 @@ export class MergeManager {
   //
   // A merge copies blocks, not style DEFINITIONS, so a `pStyle`/`rStyle`/`tblStyle`
   // the target does not define dangles (one real thesis: 1052 uses of 8 ids) and
-  // Word silently renders it as Normal. We import every referenced source style
-  // the target LACKS, with its basedOn/link/next chain.
-  //
-  // LIMITATION: when the styleId already exists in the target, the TARGET's
-  // definition wins and the source's is NOT imported — the copied text takes the
-  // target's look. That is the intended "the template owns the look" behaviour of
-  // the combine flow, but two documents that define the same id differently are
-  // not reconciled (no renaming of styles).
+  // Word silently renders it as Normal. mergeStyles.ts decides what each one becomes;
+  // here is only the writing. Existing definitions are never touched.
 
-  private collectMissingStyles(
-    source: MdocxengineType,
-    blocksXml: string,
-    styleMap: Record<string, string>,
-  ): { id: string; xml: string }[] {
-    const srcStyles = source.zip.readAsText("word/styles.xml");
-    const tgtStyles = this.zip.readAsText("word/styles.xml");
-    if (!srcStyles || !tgtStyles?.includes("</w:styles>")) return [];
-
-    const defs = new Map<string, string>();
-    for (const m of srcStyles.matchAll(/<w:style\b[^>]*\bw:styleId="([^"]+)"[^>]*>[\s\S]*?<\/w:style>/g)) {
-      defs.set(m[1], m[0]);
-    }
-    const inTarget = new Set(
-      [...tgtStyles.matchAll(/<w:style\b[^>]*\bw:styleId="([^"]+)"/g)].map((m) => m[1]),
-    );
-
-    const out: { id: string; xml: string }[] = [];
-    const seen = new Set<string>();
-    const visit = (id: string) => {
-      if (seen.has(id) || inTarget.has(id) || styleMap[id]) return;
-      seen.add(id);
-      const def = defs.get(id);
-      if (!def) return; // undefined in the source too — nothing to import
-      // Only one default style per type: the target keeps its own.
-      const xml = def.replace(/^(<w:style\b[^>]*?)\s+w:default="(?:1|true|on)"/, "$1");
-      out.push({ id, xml });
-      for (const m of def.matchAll(/<w:(?:basedOn|link|next)\b[^>]*\bw:val="([^"]+)"/g)) visit(m[1]);
-    };
-    for (const m of blocksXml.matchAll(/<w:(?:pStyle|rStyle|tblStyle)\b[^>]*\bw:val="([^"]+)"/g)) visit(m[1]);
-    return out;
+  private async importStyles(plan: StylePlan, numberingMap: Record<string, string>): Promise<void> {
+    if (plan.imports.length === 0) return;
+    const tgt = await this.stylesPartForImport();
+    const close = tgt.lastIndexOf("</w:styles>");
+    const add = plan.imports.map((x) => this.applyNumIdMap(x.xml, numberingMap)).join("");
+    this.zip.addFile("word/styles.xml", Buffer.from(tgt.slice(0, close) + add + tgt.slice(close), "utf8"));
   }
 
-  private importStyles(styles: { id: string; xml: string }[], numberingMap: Record<string, string>): void {
-    if (styles.length === 0) return;
-    const tgt = this.zip.readAsText("word/styles.xml");
-    const close = tgt.lastIndexOf("</w:styles>");
-    const add = styles.map((x) => this.applyNumIdMap(x.xml, numberingMap)).join("");
-    this.zip.addFile("word/styles.xml", Buffer.from(tgt.slice(0, close) + add + tgt.slice(close), "utf8"));
+  /** This document's styles part. One with none gets an empty one, without defaults, so that
+   *  its own text keeps rendering as it did. */
+  private async stylesPartForImport(): Promise<string> {
+    const existing = this.zip.readAsText("word/styles.xml");
+    if (existing) return existing;
+    const fresh = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"></w:styles>`;
+    if (this.zip.getEntry("word/styles.xml")) return fresh;
+    await this.contentTypes.addOverride("/word/styles.xml", "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml");
+    await this.rels.addRelationship(await this.rels.genId(), "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles", "styles.xml");
+    return fresh;
   }
 
   // ─── Unique ids: drawing ids + bookmarks ─────────────────────────────────────
@@ -683,20 +894,20 @@ export class MergeManager {
     return out;
   }
 
-  /** Point REF/PAGEREF/NOTEREF/HYPERLINK \l fields and `w:anchor` at renamed bookmarks. */
+  /** Point REF/PAGEREF/NOTEREF/HYPERLINK \l fields and `w:anchor` at renamed bookmarks. Quotes
+   *  stand escaped in an attribute, and may in a field code too. */
   private renameBookmarkRefs(xml: string, renames: Map<string, string>): string {
     const fix = (instr: string) => {
       let r = instr;
       for (const [from, to] of renames) {
         const f = from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
         r = r
-          .replace(new RegExp(`(\\b(?:REF|PAGEREF|NOTEREF)\\s+)(")?${f}(")?(?=\\s|$)`, "g"), (_m, a, q1, q2) => `${a}${q1 ?? ""}${to}${q2 ?? ""}`)
-          .replace(new RegExp(`(\\\\l\\s+")${f}(")`, "g"), `$1${to}$2`);
+          .replace(new RegExp(`(\\b(?:REF|PAGEREF|NOTEREF)\\s+(?:"|&quot;)?)${f}(?=(?:"|&quot;)?(?:\\s|$))`, "g"), (_m, a) => a + to)
+          .replace(new RegExp(`(\\\\l\\s+(?:"|&quot;))${f}(?="|&quot;)`, "g"), (_m, a) => a + to);
       }
       return r;
     };
-    return xml
-      .replace(/(<w:instrText\b[^>]*>)([^<]*)(<\/w:instrText>)/g, (_m, a, t, c) => a + fix(t) + c)
+    return rewriteFieldCodes(xml, fix)
       .replace(/(\bw:instr=")([^"]*)(")/g, (_m, a, t, c) => a + fix(t) + c)
       .replace(/(<w:hyperlink\b[^>]*\bw:anchor=")([^"]*)(")/g, (m, a, v, c) =>
         renames.has(v) ? `${a}${renames.get(v)}${c}` : m,
@@ -888,7 +1099,7 @@ export class MergeManager {
     const partXml = source.zip.readAsText(`word/${kind}s.xml`) ?? "";
     const found = new Map<string, string>();
     for (const m of partXml.matchAll(new RegExp(`<w:${kind}\\b[^>]*\\bw:id="([^"]+)"[^>]*?(?:/>|>[\\s\\S]*?</w:${kind}>)`, "g"))) {
-      if (wanted.has(m[1]) && !/\bw:type=/.test(m[0].slice(0, m[0].indexOf(">")))) found.set(m[1], m[0]);
+      if (wanted.has(m[1]) && !SEPARATOR_NOTE_TYPE.test(m[0].slice(0, m[0].indexOf(">")))) found.set(m[1], m[0]);
     }
     const missing = [...wanted].filter((id) => !found.has(id));
     if (missing.length) {
@@ -934,7 +1145,7 @@ export class MergeManager {
     const rewrite = async (raw: string): Promise<string> => {
       const xml = prepare(raw);
       const ids = new Map<string, string>();
-      for (const m of xml.matchAll(/\b(?:r:(?:id|embed|link|pict|href)|o:relid)="([^"]+)"/g)) {
+      for (const m of xml.matchAll(/\b(?:r:[a-zA-Z]+|o:relid)="([^"]+)"/g)) {
         const rel = noteRels[m[1]];
         if (!rel || ids.has(m[1])) continue;
         if (rel.external) {
@@ -965,7 +1176,7 @@ export class MergeManager {
         await relMgr.addRelationship(newId, rel.type, newPath.replace(/^word\//, ""));
         ids.set(m[1], newId);
       }
-      return this.applyAttrMap(xml, ["r:embed", "r:link", "r:id", "r:pict", "r:href", "o:relid"], Object.fromEntries(ids));
+      return this.applyAttrMap(xml, ["r:embed", "r:link", "r:id", "r:pict", "r:href", "r:dm", "r:lo", "r:qs", "r:cs", "o:relid"], Object.fromEntries(ids));
     };
     const map = await (kind === "footnote"
       ? this.footnotes.copyFootnotesVerbatim(sourceNotesXml, refIds, rewrite)
@@ -978,40 +1189,122 @@ export class MergeManager {
     return map;
   }
 
+  // ─── A note's furniture: its properties and separators ───────────────────────
+  //
+  // How notes are numbered and placed lives in word/settings.xml and in each section; the rule
+  // above them lives in the notes part. A merge's text flows into one final section, so the first
+  // part with notes of a kind decides for that kind. Whatever a later part wanted is reported.
+
+  private async settleNoteFurniture(source: MdocxengineType, kind: NoteKind): Promise<NoteConflict[]> {
+    const targetDoc = this.zip.readAsText("word/document.xml") ?? "";
+    const sourceSettings = source.zip.readAsText("word/settings.xml");
+    const sourceSect = finalSectPr(source.zip.readAsText("word/document.xml") ?? "");
+    const targetSettings = this.zip.readAsText("word/settings.xml");
+    if (noteRefIds(targetDoc, kind).size) {
+      const mine = effectiveNoteProps(kind, targetSettings, finalSectPr(targetDoc));
+      const theirs = effectiveNoteProps(kind, sourceSettings, sourceSect);
+      return Object.keys(mine)
+        .filter((property) => mine[property] !== theirs[property])
+        .map((property) => ({ kind, property, kept: mine[property], dropped: theirs[property] }));
+    }
+    // Nothing here is numbered this way yet, so nothing can change under the target's feet.
+    const adopted = await this.adoptSeparators(source, kind);
+    const inner = noteProps(notePr(sourceSettings, kind)).xml + noteSeparatorRefs(notePr(adopted ? sourceSettings : targetSettings, kind), kind);
+    await this.settings.setSettingElement(`${kind}Pr`, inner ? `<w:${kind}Pr>${inner}</w:${kind}Pr>` : null);
+    this.setFinalSectionNotePr(kind, notePr(sourceSect, kind));
+    return [];
+  }
+
+  /** The source's separators in place of this document's unused ones. False: it has none, or an
+   *  unreferenced note here already holds one of their ids. */
+  private async adoptSeparators(source: MdocxengineType, kind: NoteKind): Promise<boolean> {
+    const theirs = source.zip.readAsText(`word/${kind}s.xml`)?.match(separatorNotes(kind));
+    if (!theirs?.length) return false;
+    await (kind === "footnote" ? this.footnotes : this.endnotes).ensureRegistered();
+    const part = `word/${kind}s.xml`;
+    const ours = this.zip.readAsText(part) ?? "";
+    const open = new RegExp(`<w:${kind}s\\b[^>]*?(?<!/)>`).exec(ours);
+    if (!open) return false;
+    const rest = ours.replace(separatorNotes(kind), "");
+    const idOf = (xml: string) => /\bw:id="([^"]*)"/.exec(xml)?.[1];
+    const held = new Set([...rest.matchAll(new RegExp(`<w:${kind}\\b[^>]*`, "g"))].map((m) => idOf(m[0])));
+    if (theirs.some((note) => held.has(idOf(note)))) return false;
+    const at = rest.indexOf(open[0]) + open[0].length;
+    this.zip.addFile(part, Buffer.from(rest.slice(0, at) + theirs.join("") + rest.slice(at), "utf8"));
+    return true;
+  }
+
+  /** Put a note property element in this document's final section, at its schema position. */
+  private setFinalSectionNotePr(kind: NoteKind, element: string | null): void {
+    const xml = this.zip.readAsText("word/document.xml");
+    if (!xml) return;
+    const split = splitDocument(xml);
+    const block = split.blocks.filter((b) => b.kind === "sectPr").pop();
+    if (!block) {
+      if (!element) return;
+      split.blocks.push({ kind: "sectPr", tag: "w:sectPr", xml: `<w:sectPr>${element}</w:sectPr>` });
+    } else {
+      const next = withNotePr(block.xml, kind, element);
+      if (next === block.xml) return;
+      block.xml = next;
+    }
+    this.zip.addFile("word/document.xml", Buffer.from(assembleDocument(split), "utf8"));
+  }
+
   // ─── Numbering (Phase 2) ─────────────────────────────────────────────────────
 
   /**
-   * Copy the source's numbering definitions referenced by the blocks (abstractNum
-   * + num) into the target with fresh, collision-free ids; return source-numId →
-   * new-numId. Without this, two parts that both use `numId="1"` would share one
-   * list and renumber wrongly.
+   * Copy the source's lists something copied uses (abstractNum + num) into the target
+   * with fresh, collision-free ids; return source-numId → new-numId. Without this, two
+   * parts that both use `numId="1"` would share one list and renumber wrongly.
    */
   private async buildNumberingMap(
     source: MdocxengineType,
-    blocksXml: string,
+    srcDefs: RawNumbering,
+    styles: StylePlan,
   ): Promise<Record<string, string>> {
-    const usedNumIds = new Set(
-      [...blocksXml.matchAll(/<w:numId\b[^>]*\bw:val="([^"]+)"/g)].map((m) => m[1]),
-    );
-    if (usedNumIds.size === 0) return {};
+    if (styles.numIds.size === 0) return {};
 
-    const srcDefs = await source.numbering.getRawDefinitions();
-    if (srcDefs.nums.length === 0) return {};
-
-    const { absMax, numMax } = await this.numbering.maxIds();
+    const { absMax, numMax, picMax } = await this.numbering.maxIds();
     let nextAbs = absMax + 1;
-    let nextNum = numMax + 1;
+    // Above what this document POINTS at too: a numId with no definition prints nothing, and a
+    // copied list taking that id would number paragraphs that never were.
+    let nextNum = Math.max(numMax, this.highestNumIdInUse()) + 1;
+    let nextPic = picMax + 1;
 
     const numIdMap: Record<string, string> = {};
     const absIdMap: Record<string, string> = {};
+    const picIdMap: Record<string, string> = {};
     const addAbs: any[] = [];
     const addNum: any[] = [];
+    const addPic: any[] = [];
+
+    /** A level's picture bullet, copied with its image: a `w:lvlPicBulletId` naming nothing
+     *  makes Word refuse the whole file, so one the source itself lacks is dropped. */
+    const carryPicBullet = async (level: any) => {
+      const old = level?.["w:lvlPicBulletId"]?.$?.["w:val"];
+      if (old == null) return;
+      if (picIdMap[old] == null) {
+        const def = srcDefs.picBullets.find((p) => p?.$?.["w:numPicBulletId"] === old);
+        if (!def) {
+          delete level["w:lvlPicBulletId"];
+          return;
+        }
+        const clone = JSON.parse(JSON.stringify(def));
+        picIdMap[old] = String(nextPic++);
+        clone.$ = { ...clone.$, "w:numPicBulletId": picIdMap[old] };
+        await this.rehomeNumberingRels(source, clone);
+        addPic.push(clone);
+      }
+      level["w:lvlPicBulletId"].$["w:val"] = picIdMap[old];
+    };
 
     for (const num of srcDefs.nums) {
       const oldNumId = num?.$?.["w:numId"];
-      if (oldNumId == null || !usedNumIds.has(String(oldNumId))) continue;
+      if (oldNumId == null || !styles.numIds.has(String(oldNumId))) continue;
 
       const oldAbs = num?.["w:abstractNumId"]?.$?.["w:val"];
+      if (oldAbs == null || !srcDefs.abstractNums.some((a) => a?.$?.["w:abstractNumId"] === oldAbs)) continue;
       // Copy the referenced abstractNum once, with a fresh id.
       if (oldAbs != null && absIdMap[oldAbs] == null) {
         const absDef = srcDefs.abstractNums.find((a) => a?.$?.["w:abstractNumId"] === oldAbs);
@@ -1021,6 +1314,8 @@ export class MergeManager {
           clone.$ = { ...clone.$, "w:abstractNumId": newAbs };
           // Drop nsid so Word doesn't fold this into the source list's identity.
           if (clone["w:nsid"]) delete clone["w:nsid"];
+          retargetListRefs(clone, styles);
+          for (const level of asArray(clone["w:lvl"])) await carryPicBullet(level);
           addAbs.push(clone);
           absIdMap[oldAbs] = newAbs;
         }
@@ -1032,12 +1327,65 @@ export class MergeManager {
       if (numClone["w:abstractNumId"]?.$ && oldAbs != null && absIdMap[oldAbs] != null) {
         numClone["w:abstractNumId"].$ = { ...numClone["w:abstractNumId"].$, "w:val": absIdMap[oldAbs] };
       }
+      retargetListRefs(numClone, styles);
+      for (const override of asArray<any>(numClone["w:lvlOverride"])) {
+        if (override?.["w:lvl"]) await carryPicBullet(override["w:lvl"]);
+      }
       addNum.push(numClone);
       numIdMap[String(oldNumId)] = newNumId;
     }
 
-    await this.numbering.appendRawDefinitions(addAbs, addNum);
+    await this.numbering.appendRawDefinitions(addAbs, addNum, addPic);
+    // A numId with no list behind it prints nothing in the source, and has to go on printing
+    // nothing: left as it is, it would fall into whatever list this document has of that id.
+    for (const id of styles.numIds) if (numIdMap[id] == null && id !== "0") numIdMap[id] = "0";
     return numIdMap;
+  }
+
+  private highestNumIdInUse(): number {
+    let max = 0;
+    for (const { entryName } of this.zip.getEntries()) {
+      if (!/^word\/[^/]+\.xml$/.test(entryName) || entryName === "word/numbering.xml") continue;
+      for (const m of (this.zip.readAsText(entryName) ?? "").matchAll(/<w:numId\b[^>]*\bw:val="(\d+)"/g)) max = Math.max(max, Number(m[1]));
+    }
+    return max;
+  }
+
+  /** A picture bullet's image is reached through the numbering part's own relationships. */
+  private async rehomeNumberingRels(source: MdocxengineType, node: any): Promise<void> {
+    const relsXml = source.zip.readAsText(NUMBERING_RELS_PATH);
+    if (!relsXml) return;
+    const parsed: any = await parseXml(relsXml);
+    const rels = new Map<string, any>(asArray<any>(parsed?.Relationships?.Relationship).map((r) => [r?.$?.Id, r?.$]));
+    const relMgr = new RelManager(this.zip, NUMBERING_RELS_PATH);
+    const moved = new Map<string, string>();
+    const walk = async (n: any): Promise<void> => {
+      if (Array.isArray(n)) {
+        for (const x of n) await walk(x);
+        return;
+      }
+      if (!n || typeof n !== "object") return;
+      for (const [attr, value] of Object.entries<any>(n.$ ?? {})) {
+        if (!/^(?:r:[a-zA-Z]+|o:relid)$/.test(attr)) continue;
+        const rel = rels.get(value);
+        if (!rel) continue;
+        if (!moved.has(value)) {
+          if (rel.TargetMode === "External") {
+            const id = await relMgr.genId();
+            await relMgr.addRelationship(id, rel.Type, rel.Target, "External");
+            moved.set(value, id);
+          } else {
+            const bytes = source.zip.getEntry(resolvePartPath("word/numbering.xml", rel.Target))?.getData();
+            if (!bytes) continue;
+            const ext = (/\.([a-zA-Z0-9]+)$/.exec(rel.Target)?.[1] ?? "png").toLowerCase();
+            moved.set(value, await this.media.addImageToPartRels("word/numbering.xml", bytes, ext));
+          }
+        }
+        n.$[attr] = moved.get(value);
+      }
+      for (const [key, child] of Object.entries(n)) if (key !== "$") await walk(child);
+    };
+    await walk(node);
   }
 
   /** Remap w:val inside <w:numId .../> elements only. */
@@ -1078,14 +1426,6 @@ export class MergeManager {
     if (Object.keys(idMap).length === 0) return xml;
     return xml.replace(new RegExp(`<w:${kind}Reference\\b[^>]*>`, "g"), (tag) =>
       tag.replace(/\bw:id="([^"]+)"/, (full, val) => (idMap[val] ? `w:id="${idMap[val]}"` : full)),
-    );
-  }
-
-  /** Retarget <w:pStyle w:val="X"/> by name. */
-  private applyStyleMap(xml: string, styleMap: Record<string, string>): string {
-    if (Object.keys(styleMap).length === 0) return xml;
-    return xml.replace(/<w:pStyle\b[^>]*\bw:val="([^"]+)"[^>]*\/?>/g, (tag, val) =>
-      styleMap[val] ? tag.replace(`w:val="${val}"`, `w:val="${styleMap[val]}"`) : tag,
     );
   }
 }

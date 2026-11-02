@@ -1,6 +1,7 @@
 import * as XmlUtils from "@/utils/xmlUtils";
 import { RelManager } from "@/core/PartsManagers/RelManager";
 import { ContentTypesManager } from "./ContentTypesManager";
+import { SEPARATOR_NOTE_TYPE } from "./FootnoteManager";
 import { Run as RunInterface } from "@/core/files/paragraph/types";
 import AdmZip from "adm-zip";
 import { wordRootAttributes } from "@/utils/rootNamespaces";
@@ -80,7 +81,7 @@ export class EndnoteManager {
 
   // ─── Registration ─────────────────────────────────────────────────────────
 
-  private async ensureRegistered(): Promise<void> {
+  public async ensureRegistered(): Promise<void> {
     if (!this.zip.getEntry(ENDNOTES_PATH)) {
       await this.writeEndnotes(this.emptyEndnotesDoc());
       await this.contentTypes.addOverride(`/${ENDNOTES_PATH}`, ENDNOTE_CONTENT_TYPE);
@@ -100,7 +101,7 @@ export class EndnoteManager {
   public async getEndnotes(): Promise<EndnoteEntry[]> {
     const obj = await this.readEndnotes();
     return this.normalizeArray(obj)
-      .filter((e) => !e.$?.["w:type"])
+      .filter((e) => !/^(?:separator|continuationSeparator|continuationNotice)$/.test(e.$?.["w:type"] ?? ""))
       .map((e) => ({
         id: parseInt(e.$?.["w:id"] ?? "0", 10),
         text: this.extractText(e),
@@ -163,7 +164,7 @@ export class EndnoteManager {
     let m: RegExpExecArray | null;
     while ((m = re.exec(sourceEndnotesXml)) !== null) {
       const openTag = m[0].slice(0, m[0].indexOf(">"));
-      if (/\bw:type=/.test(openTag)) continue; // separator / continuationSeparator
+      if (SEPARATOR_NOTE_TYPE.test(openTag)) continue;
       if (!neededIds.has(m[1])) continue;
       elements.push({ id: m[1], xml: m[0] });
     }

@@ -16,6 +16,8 @@ export interface NumberingDefinition {
 
 /** Raw parsed numbering parts (xml2js objects), for cross-document copy. */
 export interface RawNumbering {
+  /** `<w:numPicBullet>`: the picture a level's `w:lvlPicBulletId` names. */
+  picBullets: any[];
   abstractNums: any[];
   nums: any[];
 }
@@ -37,6 +39,8 @@ export class NumberingManager {
 
   private async writeNumbering(obj: any): Promise<void> {
     const isNew = !this.zip.getEntry(NUMBERING_PATH);
+    // A fresh root declares its namespaces, or the part is one Word refuses to read.
+    if (!obj["w:numbering"].$) obj["w:numbering"].$ = { ...wordRootAttributes(), "xmlns:w": W_MAIN_NS };
     const xml = XmlUtils.buildXml(obj["w:numbering"], {
       rootName: "w:numbering",
       headless: false,
@@ -117,45 +121,49 @@ export class NumberingManager {
 
   // ── Cross-document copy primitives (used by MergeManager) ──────────────────
 
-  /** Raw `<w:abstractNum>` + `<w:num>` arrays from this document's numbering.xml. */
+  /** Raw `<w:numPicBullet>`, `<w:abstractNum>` + `<w:num>` arrays from this document's numbering.xml. */
   public async getRawDefinitions(): Promise<RawNumbering> {
     const obj = await this.readNumbering();
-    const a = obj?.["w:numbering"]?.["w:abstractNum"];
-    const n = obj?.["w:numbering"]?.["w:num"];
-    return {
-      abstractNums: Array.isArray(a) ? a : a ? [a] : [],
-      nums: Array.isArray(n) ? n : n ? [n] : [],
+    const list = (k: string) => {
+      const v = obj?.["w:numbering"]?.[k];
+      return Array.isArray(v) ? v : v ? [v] : [];
     };
+    return { picBullets: list("w:numPicBullet"), abstractNums: list("w:abstractNum"), nums: list("w:num") };
   }
 
-  /** Highest existing abstractNumId / numId (for collision-free allocation). */
-  public async maxIds(): Promise<{ absMax: number; numMax: number }> {
-    const { abstractNums, nums } = await this.getRawDefinitions();
-    const absMax = abstractNums.reduce(
-      (m, x) => Math.max(m, parseInt(x?.$?.["w:abstractNumId"] ?? "0", 10) || 0),
-      0,
-    );
-    const numMax = nums.reduce((m, x) => Math.max(m, parseInt(x?.$?.["w:numId"] ?? "0", 10) || 0), 0);
-    return { absMax, numMax };
+  /** Highest existing id of each kind (for collision-free allocation). */
+  public async maxIds(): Promise<{ absMax: number; numMax: number; picMax: number }> {
+    const { picBullets, abstractNums, nums } = await this.getRawDefinitions();
+    const max = (xs: any[], attr: string) => xs.reduce((m, x) => Math.max(m, parseInt(x?.$?.[attr] ?? "0", 10) || 0), -1);
+    return {
+      absMax: Math.max(0, max(abstractNums, "w:abstractNumId")),
+      numMax: Math.max(0, max(nums, "w:numId")),
+      picMax: max(picBullets, "w:numPicBulletId"),
+    };
   }
 
   /**
-   * Append already-id-rewritten `<w:abstractNum>` + `<w:num>` nodes. Keeps the
-   * schema order (all abstractNum before all num) because they are separate keys.
+   * Append already-id-rewritten nodes. `CT_Numbering` is a sequence (picture bullets,
+   * abstractNum, num, the rest), and the builder writes keys in insertion order, so the
+   * root is rebuilt in that order: a key added last would land after `w:num`.
    */
-  public async appendRawDefinitions(abstractNums: any[], nums: any[]): Promise<void> {
-    if (abstractNums.length === 0 && nums.length === 0) return;
+  public async appendRawDefinitions(abstractNums: any[], nums: any[], picBullets: any[] = []): Promise<void> {
+    if (abstractNums.length === 0 && nums.length === 0 && picBullets.length === 0) return;
     const obj = await this.readNumbering();
-    if (!obj["w:numbering"]) obj["w:numbering"] = {};
-    const root = obj["w:numbering"];
-    if (!root.$) root.$ = { ...wordRootAttributes(), "xmlns:w": W_MAIN_NS };
-    const ensureArr = (k: string) => {
-      root[k] = Array.isArray(root[k]) ? root[k] : root[k] ? [root[k]] : [];
+    const root = obj["w:numbering"] ?? {};
+    const merged = (k: string, more: any[]) => {
+      const had = Array.isArray(root[k]) ? root[k] : root[k] ? [root[k]] : [];
+      return [...had, ...more];
     };
-    ensureArr("w:abstractNum");
-    ensureArr("w:num");
-    root["w:abstractNum"].push(...abstractNums);
-    root["w:num"].push(...nums);
+    const { $, "w:numPicBullet": _pics, "w:abstractNum": _abs, "w:num": _nums, ...rest } = root;
+    const pics = merged("w:numPicBullet", picBullets);
+    obj["w:numbering"] = {
+      ...($ ? { $ } : {}),
+      ...(pics.length ? { "w:numPicBullet": pics } : {}),
+      "w:abstractNum": merged("w:abstractNum", abstractNums),
+      "w:num": merged("w:num", nums),
+      ...rest,
+    };
     await this.writeNumbering(obj);
   }
 }

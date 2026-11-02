@@ -67,6 +67,25 @@ export function applySettingToXml(
   name: string,
   attrs: Record<string, string> | null,
 ): { xml: string; changed: boolean } {
+  if (attrs === null) return applySettingElementToXml(settingsXml, name, null);
+
+  const attrText = Object.entries(attrs)
+    .map(([k, v]) => ` ${k.includes(":") ? k : `w:${k}`}="${escAttr(v)}"`)
+    .join("");
+  return applySettingElementToXml(settingsXml, name, `<w:${name}${attrText}/>`);
+}
+
+/**
+ * The same for a whole element, children included (`w:footnotePr`): `element === null`
+ * removes it, and anything else stands at its schema position, replacing what was there.
+ *
+ * @throws as {@link applySettingToXml} does.
+ */
+export function applySettingElementToXml(
+  settingsXml: string,
+  name: string,
+  element: string | null,
+): { xml: string; changed: boolean } {
   const rank = CT_SETTINGS_ORDER.indexOf(name);
   if (rank === -1) throw new Error(`SettingsManager.setSetting: "${name}" is not a CT_Settings element`);
 
@@ -75,19 +94,14 @@ export function applySettingToXml(
   if (!/<\/w:settings>/.test(xml)) throw new Error("SettingsManager.setSetting: no <w:settings> root");
 
   const existing = findElement(xml, name);
-  if (attrs === null) {
+  if (element === null) {
     if (!existing) return { xml: settingsXml, changed: false };
     return { xml: xml.slice(0, existing.start) + xml.slice(existing.end), changed: true };
   }
 
-  const attrText = Object.entries(attrs)
-    .map(([k, v]) => ` ${k.includes(":") ? k : `w:${k}`}="${escAttr(v)}"`)
-    .join("");
-  const el = `<w:${name}${attrText}/>`;
-
   if (existing) {
-    if (xml.slice(existing.start, existing.end) === el) return { xml: settingsXml, changed: false };
-    return { xml: xml.slice(0, existing.start) + el + xml.slice(existing.end), changed: true };
+    if (xml.slice(existing.start, existing.end) === element) return { xml: settingsXml, changed: false };
+    return { xml: xml.slice(0, existing.start) + element + xml.slice(existing.end), changed: true };
   }
 
   let at = xml.lastIndexOf("</w:settings>");
@@ -95,7 +109,7 @@ export function applySettingToXml(
     const f = findElement(xml, later);
     if (f && f.start < at) at = f.start;
   }
-  xml = xml.slice(0, at) + el + xml.slice(at);
+  xml = xml.slice(0, at) + element + xml.slice(at);
   return { xml, changed: true };
 }
 
@@ -115,13 +129,22 @@ export class SettingsManager {
     name: string,
     attrs: Record<string, string> | null,
   ): Promise<{ changed: boolean }> {
+    return this.write((xml) => applySettingToXml(xml, name, attrs), attrs === null);
+  }
+
+  /** The same for a whole element, children included, such as `w:footnotePr`. */
+  public async setSettingElement(name: string, element: string | null): Promise<{ changed: boolean }> {
+    return this.write((xml) => applySettingElementToXml(xml, name, element), element === null);
+  }
+
+  private async write(apply: (xml: string) => { xml: string; changed: boolean }, removing: boolean): Promise<{ changed: boolean }> {
     let xml = this.zip.readAsText(SETTINGS_PATH);
     const fresh = !xml;
     if (fresh) {
-      if (attrs === null) return { changed: false };
+      if (removing) return { changed: false };
       xml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings xmlns:w="${W_NS}"></w:settings>`;
     }
-    const r = applySettingToXml(xml, name, attrs);
+    const r = apply(xml);
     if (!r.changed) return { changed: false };
     this.zip.addFile(SETTINGS_PATH, Buffer.from(r.xml, "utf-8"));
     if (fresh) {

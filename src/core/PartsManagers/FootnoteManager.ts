@@ -17,6 +17,9 @@ export interface FootnoteEntry {
   text: string;
 }
 
+/** A note's open tag says it is a separator. `w:type="normal"` is an ordinary note. */
+export const SEPARATOR_NOTE_TYPE = /\bw:type="(?:separator|continuationSeparator|continuationNotice)"/;
+
 export class FootnoteManager {
   private zip: AdmZip;
   private rels: RelManager;
@@ -85,7 +88,7 @@ export class FootnoteManager {
 
   // ─── Registration (called once when footnotes are first added) ────────────
 
-  private async ensureRegistered(): Promise<void> {
+  public async ensureRegistered(): Promise<void> {
     const alreadyExists = this.zip.getEntry(FOOTNOTES_PATH);
     if (!alreadyExists) {
       await this.writeFootnotes(this.emptyFootnotesDoc());
@@ -106,7 +109,7 @@ export class FootnoteManager {
   public async getFootnotes(): Promise<FootnoteEntry[]> {
     const obj = await this.readFootnotes();
     return this.normalizeArray(obj)
-      .filter((f) => !f.$?.["w:type"])
+      .filter((f) => !/^(?:separator|continuationSeparator|continuationNotice)$/.test(f.$?.["w:type"] ?? ""))
       .map((f) => ({
         id: parseInt(f.$?.["w:id"] ?? "0", 10),
         text: this.extractText(f),
@@ -177,7 +180,7 @@ export class FootnoteManager {
     let m: RegExpExecArray | null;
     while ((m = re.exec(sourceFootnotesXml)) !== null) {
       const openTag = m[0].slice(0, m[0].indexOf(">"));
-      if (/\bw:type=/.test(openTag)) continue; // separator / continuationSeparator
+      if (SEPARATOR_NOTE_TYPE.test(openTag)) continue;
       if (!neededIds.has(m[1])) continue;
       elements.push({ id: m[1], xml: m[0] });
     }

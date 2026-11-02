@@ -1,5 +1,6 @@
 import { describe, test, expect } from "vitest";
 import { Mdocxengine, type BodyBlock } from "../index";
+import { fixture, note, notesPart, type FixtureOptions } from "./docx-fixture";
 
 /**
  * Ids that must stay unique across a merge: `wp:docPr/@id`, `w:bookmarkStart/@w:id`
@@ -87,5 +88,77 @@ describe("merge keeps ids unique", () => {
     const xml = await body(t);
     expect(xml).toContain('REF "a.b_m1" \\h');
     expect(xml).toContain("REF aXb \\h");
+  });
+});
+
+describe("a renamed bookmark's references follow it everywhere", () => {
+  const FIELD = (...pieces: string[]) =>
+    `<w:r><w:fldChar w:fldCharType="begin"/></w:r>` +
+    pieces.map((t) => `<w:r><w:instrText xml:space="preserve">${t}</w:instrText></w:r>`).join("") +
+    `<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>cached</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>`;
+  const MARK = (t: string) => `<w:p><w:bookmarkStart w:id="1" w:name="_Ref100"/><w:r><w:t>${t}</w:t></w:r><w:bookmarkEnd w:id="1"/></w:p>`;
+  const NOTE_REF = `<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>`;
+
+  const mergedWith = async (source: FixtureOptions) => {
+    const t = await Mdocxengine.loadFromBuffer(fixture({ body: MARK("first") }));
+    await t.merge.appendDocument(fixture(source));
+    return { doc: t.zip.readAsText("word/document.xml")!, notes: t.zip.readAsText("word/footnotes.xml") ?? "" };
+  };
+  const instr = (xml: string) => [...xml.matchAll(/<w:instrText[^>]*>([^<]*)/g)].map((m) => m[1]).join("|");
+
+  test("into a copied footnote: a REF field and a link to the renamed bookmark", async () => {
+    const { doc, notes } = await mergedWith({
+      body: MARK("second") + NOTE_REF,
+      footnotes: notesPart("footnote", note("footnote", 1, `<w:p>${FIELD(" REF _Ref100 \\h ")}<w:hyperlink w:anchor="_Ref100"><w:r><w:t>go</w:t></w:r></w:hyperlink></w:p>`)),
+    });
+    expect([...doc.matchAll(/w:name="([^"]+)"/g)].map((m) => m[1])).toEqual(["_Ref100", "_Ref100_m1"]);
+    expect(instr(notes)).toBe(" REF _Ref100_m1 \\h ");
+    expect(notes).toContain('w:anchor="_Ref100_m1"');
+  });
+
+  test("into an endnote and a fldSimple, with the quotes an attribute must escape", async () => {
+    const t = await Mdocxengine.loadFromBuffer(fixture({ body: MARK("first") }));
+    await t.merge.appendDocument(
+      fixture({
+        body: MARK("second") + `<w:p><w:r><w:endnoteReference w:id="1"/></w:r></w:p>`,
+        endnotes: notesPart("endnote", note("endnote", 1, `<w:p><w:fldSimple w:instr=" HYPERLINK \\l &quot;_Ref100&quot; "><w:r><w:t>x</w:t></w:r></w:fldSimple><w:fldSimple w:instr=" PAGEREF &quot;_Ref100&quot; "><w:r><w:t>1</w:t></w:r></w:fldSimple></w:p>`)),
+      }),
+    );
+    const notes = t.zip.readAsText("word/endnotes.xml")!;
+    expect(notes).toContain("HYPERLINK \\l &quot;_Ref100_m1&quot;");
+    expect(notes).toContain("PAGEREF &quot;_Ref100_m1&quot;");
+  });
+
+  test("a field code split across runs, in the body and in a note", async () => {
+    const split = FIELD(" REF ", "_Ref", "100 \\h ");
+    const { doc, notes } = await mergedWith({
+      body: MARK("second") + `<w:p>${split}</w:p>` + NOTE_REF,
+      footnotes: notesPart("footnote", note("footnote", 1, `<w:p>${split}</w:p>`)),
+    });
+    const copied = doc.slice(doc.indexOf("second"));
+    expect(instr(copied).replace(/\|/g, "")).toBe(" REF _Ref100_m1 \\h ");
+    expect(instr(notes).replace(/\|/g, "")).toBe(" REF _Ref100_m1 \\h ");
+    // Each run stays: only the words moved.
+    expect(copied.match(/<w:instrText/g)).toHaveLength(3);
+  });
+
+  test("a nested field's code is its own, and an unrelated field is left alone", async () => {
+    const nested =
+      `<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> IF </w:instrText></w:r>` +
+      `<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> REF </w:instrText></w:r><w:r><w:instrText xml:space="preserve">_Ref100 </w:instrText></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>` +
+      `<w:r><w:instrText xml:space="preserve"> = 1 </w:instrText></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>`;
+    const { doc } = await mergedWith({ body: MARK("second") + `<w:p>${nested}</w:p><w:p>${FIELD(" SEQ Figure \\* ARABIC ")}</w:p>` });
+    const copied = doc.slice(doc.indexOf("second"));
+    expect(instr(copied).split("|").join("")).toContain(" REF _Ref100_m1 ");
+    expect(instr(copied)).toContain(" IF ");
+    expect(instr(copied)).toContain(" SEQ Figure \\* ARABIC ");
+  });
+
+  test("a bookmark that lives inside a note is renamed too, when its name is taken", async () => {
+    const { notes } = await mergedWith({
+      body: NOTE_REF + `<w:p>${FIELD(" NOTEREF _Ref100 \\h ")}</w:p>`,
+      footnotes: notesPart("footnote", note("footnote", 1, `<w:p><w:bookmarkStart w:id="5" w:name="_Ref100"/><w:r><w:t>n</w:t></w:r><w:bookmarkEnd w:id="5"/></w:p>`)),
+    });
+    expect(notes).toContain('w:name="_Ref100_m1"');
   });
 });

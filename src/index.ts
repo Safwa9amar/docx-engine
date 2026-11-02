@@ -291,7 +291,7 @@ export type { PageNumberFormat } from "./core/PartsManagers/FooterManager";
 export { SettingsManager, applySettingToXml, CT_SETTINGS_ORDER } from "./core/PartsManagers/SettingsManager";
 export type { SectPrGeometry } from "./core/files/body/sectPr";
 export { DEFAULT_STYLE_ALIASES } from "./core/PartsManagers/MergeManager";
-export type { AppendOptions, AppendResult } from "./core/PartsManagers/MergeManager";
+export type { AppendOptions, AppendResult, NoteConflict } from "./core/PartsManagers/MergeManager";
 export { default as Paragraph } from "./core/files/paragraph/index";
 export { Run } from "./core/files/paragraph/Run";
 export { Table } from "./core/files/table/index";
