@@ -178,6 +178,10 @@ export interface ConvertedCaption {
   before: string;
   /** Its text after — the same wording, now with a live number. */
   after: string;
+  /** The number the student had typed ("" if none); the live field replaces it. */
+  typedNumber: string;
+  /** The live number now shown by the field. */
+  number: string;
 }
 
 export interface SkippedTextCaption {
@@ -194,6 +198,17 @@ export interface ConvertTextCaptionsResult {
   /** True when nothing was written. */
   dryRun: boolean;
 }
+
+/** Why {@link CaptionManager.addGeneratedCaption} left a block alone. */
+export type GeneratedCaptionRefusal =
+  | "no-such-block"
+  | "not-a-paragraph"
+  | "already-a-caption"
+  | "is-a-heading"
+  | "empty-text"
+  | "contains-image";
+
+const DEFAULT_LABEL: Record<CaptionKind, string> = { figure: "Figure", table: "Table", equation: "Equation" };
 
 export interface CaptionEntry {
   /** The SEQ identifier the caption is numbered under (e.g. "Figure"). */
@@ -508,6 +523,17 @@ const TEXT_CAPTION_RE = new RegExp(
   "i",
 );
 
+/**
+ * A list-style number typed IN FRONT of the label: `2- جدول …`, `3) Figure : x`,
+ * `١. شكل س`. It needs a closing mark (`-`, `.`, `)`, …) so a section number
+ * like `2.1 Tableau …` never reads as one. 1 = the number as typed.
+ */
+const LEAD_DIGITS = "[0-9\\u0660-\\u0669]+"; // digits only: "civil- Tableau" is not numbered
+const LEAD_NUMBER_RE = new RegExp(
+  `^[\\s\\u00A0]*[([]?[\\s\\u00A0]*(${LEAD_DIGITS}(?:[\\s\\u00A0]*[.\\-–—/][\\s\\u00A0]*${LEAD_DIGITS})*)` +
+  "[\\s\\u00A0]*[)\\]]?[\\s\\u00A0]*[.\\-–—:：)/][\\s\\u00A0]*",
+);
+
 /** True for a separator that PUNCTUATES — the strongest "this is a caption" signal. */
 const PUNCTUATED = /[:：.\-–—،,]/;
 
@@ -521,6 +547,12 @@ export interface TextCaptionMatch {
   separator: string;
   /** The caption wording after the label, number and separator. */
   text: string;
+  /**
+   * A list-style number typed BEFORE the label ("2- " in "2- جدول …"); "" when
+   * there is none. When the label carries no number of its own, `rawNumber`
+   * holds this one.
+   */
+  leadingNumber: string;
 }
 
 /**
@@ -534,6 +566,18 @@ export interface TextCaptionMatch {
  * open with a lowercase word.
  */
 export function parseTextCaption(text: string): TextCaptionMatch | null {
+  const plain = parseCaptionBody(text, false);
+  if (plain) return plain;
+  // "2- جدول البيان": a typed list number in front is a caption number too.
+  const lead = LEAD_NUMBER_RE.exec(text);
+  if (!lead) return null;
+  const inner = parseCaptionBody(text.slice(lead[0].length), true);
+  if (!inner) return null;
+  const leadingNumber = lead[1].replace(/[\s\u00A0]+/g, "");
+  return { ...inner, rawNumber: inner.rawNumber || leadingNumber, leadingNumber };
+}
+
+function parseCaptionBody(text: string, hasLead: boolean): TextCaptionMatch | null {
   const m = TEXT_CAPTION_RE.exec(text);
   if (!m) return null;
 
@@ -548,11 +592,13 @@ export function parseTextCaption(text: string): TextCaptionMatch | null {
 
   const punctuated = PUNCTUATED.test(separator);
   // "Table of contents" / "Figure" alone: a label and nothing that marks a caption.
-  if (!rawNumber && !punctuated) return null;
+  if (!rawNumber && !punctuated && !hasLead) return null;
+  // A typed list number in front of a bare label ("2- Figure") is not a caption.
+  if (hasLead && !rawNumber && !punctuated && !body) return null;
   if (body.length > 300) return null;
   if (!punctuated && body && (body.length > 80 || /^\p{Ll}/u.test(body))) return null;
 
-  return { kind, rawLabel: normalizeLabel(rawLabel), rawNumber, separator, text: body };
+  return { kind, rawLabel: normalizeLabel(rawLabel), rawNumber, separator, text: body, leadingNumber: "" };
 }
 
 /** `<w:p …>` / `</w:p>`, normalising a self-closing `<w:p …/>` into a pair. */
@@ -585,6 +631,21 @@ function existingBookmarks(xml: string): { starts: string; ends: string } {
     starts: (xml.match(/<w:bookmarkStart\b[^>]*\/>/g) ?? []).join(""),
     ends:   (xml.match(/<w:bookmarkEnd\b[^>]*\/>/g) ?? []).join(""),
   };
+}
+
+/** Name prefix of the hidden bookmark that wraps a GENERATED caption's separator. */
+const SEP_BOOKMARK = "_CapSep";
+
+/**
+ * Drop the separator run `addGeneratedCaption` wrote ("`: `") from the text that
+ * follows a caption's number, so `text` is the student's own words only. A
+ * converted caption has no such marker — its separator IS part of its text.
+ */
+function stripGeneratedSeparator(region: string): string {
+  return region.replace(
+    new RegExp(`<w:bookmarkStart w:id="(\\d+)" w:name="${SEP_BOOKMARK}\\d*"/>[\\s\\S]*?<w:bookmarkEnd w:id="\\1"/>`),
+    "",
+  );
 }
 
 /**
@@ -621,7 +682,7 @@ export function parseCaptionParagraph(xml: string, blockIndex = 0): CaptionEntry
       label: seq.id,
       displayLabel: paragraphText(xml.slice(labelStart, groupStart)).trim(),
       number: f.resultStart >= 0 ? paragraphText(xml.slice(f.resultStart, f.resultEnd)).trim() : "",
-      text: paragraphText(xml.slice(f.end, textEnd)).trim(),
+      text: paragraphText(stripGeneratedSeparator(xml.slice(f.end, textEnd))).trim(),
       fullText: paragraphText(xml.slice(labelStart, textEnd)).trim(),
       blockIndex,
       paragraphIndex: blockIndex,
@@ -1041,9 +1102,69 @@ export class CaptionManager {
       label: labels[hit.match.kind]!,
       before: paragraphText(hit.xml).trim(),
       after: paragraphText(eachParagraph(blocks[hit.blockIndex].xml)[hit.paraOrdinal]?.xml ?? "").trim(),
+      typedNumber: hit.match.rawNumber,
+      number: parseCaptionParagraph(eachParagraph(blocks[hit.blockIndex].xml)[hit.paraOrdinal]?.xml ?? "")[0]?.number ?? "",
     }));
 
     return { converted, skipped, labels, dryRun: opts.dryRun === true };
+  }
+
+  /**
+   * Give an UNNUMBERED caption a real label and number, leaving the student's
+   * own words alone.
+   *
+   * A student who typed just "البيان المالي" under a table has a caption in
+   * everything but name. This writes `label + SEQ field + separator` in FRONT of
+   * their runs and switches the style to Caption — the label and number are
+   * generated apparatus, like a page number. Unlike {@link convertTextCaptions}
+   * it never rebuilds the runs from text: footnote references, hyperlinks,
+   * fields, bookmarks and run formatting stay byte-identical and in order.
+   *
+   * Refuses, changing nothing, when the block is not a paragraph, already is a
+   * real caption, is a heading, has no text, or carries a picture (the label
+   * would land in front of the image, not the wording).
+   */
+  public async addGeneratedCaption(
+    blockIndex: number,
+    opts: { kind: CaptionKind; label?: string; rtl?: boolean; textSeparator?: string; numbering?: CaptionNumberingOptions },
+  ): Promise<{ ok: true; label: string; number: string } | { ok: false; reason: GeneratedCaptionRefusal }> {
+    const blocks = await this.doc.getBlocks();
+    const block  = blocks[blockIndex];
+    if (!block) return { ok: false, reason: "no-such-block" };
+    if (block.kind !== "paragraph") return { ok: false, reason: "not-a-paragraph" };
+    const xml = block.xml;
+    if (this.readCaptions(xml, blockIndex).length) return { ok: false, reason: "already-a-caption" };
+    if (paragraphHeadingLevel(xml) > 0) return { ok: false, reason: "is-a-heading" };
+    if (!paragraphText(xml).trim()) return { ok: false, reason: "empty-text" };
+    if (/<w:(?:drawing|pict|object)\b/.test(xml)) return { ok: false, reason: "contains-image" };
+
+    await this.ensureStyles();
+
+    const label = (opts.label ?? DEFAULT_LABEL[opts.kind]).trim();
+    const rtl   = opts.rtl ?? /<w:rtl\b|<w:bidi\b/.test(xml);
+    const rPr   = paragraphRunPropsXml(xml) || (rtl ? "<w:rPr><w:rtl/></w:rPr>" : "");
+    const ids   = this.bookmarkSeries();
+    const bm    = ids();
+    const sepBm = ids();
+    // Label + number only (no text), exactly as captionContent builds them.
+    const prefix = this.captionContent({ label, numbering: opts.numbering, rtl }, 1, 1, bm, rPr);
+    const sep    = opts.textSeparator ?? ": ";
+    const sepRun =
+      `<w:bookmarkStart w:id="${sepBm.id}" w:name="${SEP_BOOKMARK}${sepBm.id}"/>` +
+      `<w:r>${rPr}<w:t xml:space="preserve">${escapeXmlContent(sep)}</w:t></w:r>` +
+      `<w:bookmarkEnd w:id="${sepBm.id}"/>`;
+
+    const shell = paragraphShell(xml);
+    const inner = xml.slice(shell.head.length, xml.endsWith("</w:p>") ? xml.length - "</w:p>".length : xml.length);
+    const pPr   = paragraphPropsXml(xml);
+    const rest  = pPr ? inner.slice(inner.indexOf(pPr) + pPr.length) : inner;
+    block.xml = `${shell.head}${captionPPr(xml)}${prefix}${sepRun}${rest}${shell.tail}`;
+
+    this.renumberBlocks(blocks);
+    await this.doc.saveBlocks(blocks);
+
+    const entry = parseCaptionParagraph(blocks[blockIndex].xml, blockIndex)[0];
+    return { ok: true, label, number: entry?.number ?? "" };
   }
 
   /**

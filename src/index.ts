@@ -387,6 +387,7 @@ export type {
   SkippedTextCaption,
   SkipReason,
   TextCaptionMatch,
+  GeneratedCaptionRefusal,
 } from "./core/PartsManagers/CaptionManager";
 export { seqIdentifier, formatSeqNumber, parseCaptionParagraph, parseTextCaption } from "./core/PartsManagers/CaptionManager";
 export type { CommentEntry } from "./core/PartsManagers/CommentsManager";
