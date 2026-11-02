@@ -30,6 +30,7 @@ import {
 import { pixelsToEmu, type InlineImage } from "./core/PartsManagers/MediaManager";
 import { RelManager } from "./core/PartsManagers/RelManager";
 import type { SectionEntry, SectionHeaderFooterRef } from "./core/PartsManagers/SectionManager";
+import type { SectPrGeometry } from "./core/files/body/sectPr";
 import type { SectPrPageBorderOptions } from "./core/files/body/sectPr";
 import {
   TextStyleManager,
@@ -1386,6 +1387,16 @@ export class Doc {
     if (paraIndex === 0) return { changed: false };
     await this.engine.sections.addSectionBreak(paraIndex - 1, breakType);
     return { changed: true };
+  }
+
+  /**
+   * Set the page size / margins of the section CONTAINING the block at
+   * `blockIndex` (byte-safe; only the named attributes change).
+   */
+  async setSectionGeometry(blockIndex: number, geometry: SectPrGeometry): Promise<SectionEditResult> {
+    const { sections, sectionIndex } = await this.resolveSection(blockIndex);
+    await this.engine.sections.setSectionGeometry(sectionIndex, geometry);
+    return { sectionIndex, totalSections: sections.length };
   }
 
   /**

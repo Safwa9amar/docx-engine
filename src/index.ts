@@ -6,6 +6,7 @@ import HeaderManager from "./core/PartsManagers/HeaderManager";
 import RootRelManager from "./core/PartsManagers/RootRelManager";
 import { RelManager } from "./core/PartsManagers/RelManager";
 import { StylesManager } from "./core/PartsManagers/StylesManager";
+import { SettingsManager } from "./core/PartsManagers/SettingsManager";
 import { NumberingManager } from "./core/PartsManagers/NumberingManager";
 import { MetadataManager } from "./core/PartsManagers/MetadataManager";
 import { MediaManager } from "./core/PartsManagers/MediaManager";
@@ -65,6 +66,7 @@ class Mdocxengine {
   comments: CommentsManager;
   trackedChanges: TrackedChangesManager;
   sections: SectionManager;
+  settings: SettingsManager;
   shapes: ShapeManager;
   merge: MergeManager;
   formatting: FormattingManager;
@@ -92,6 +94,7 @@ class Mdocxengine {
     this.comments       = new CommentsManager(zip);
     this.trackedChanges = new TrackedChangesManager(zip);
     this.sections       = new SectionManager(zip);
+    this.settings       = new SettingsManager(zip);
     this.shapes         = new ShapeManager(zip);
     this.merge          = new MergeManager(zip);
     this.formatting     = new FormattingManager(zip);
@@ -285,6 +288,8 @@ export type {
   BlockRenderer,
 } from "./core/markdown/index";
 export type { PageNumberFormat } from "./core/PartsManagers/FooterManager";
+export { SettingsManager, applySettingToXml, CT_SETTINGS_ORDER } from "./core/PartsManagers/SettingsManager";
+export type { SectPrGeometry } from "./core/files/body/sectPr";
 export { DEFAULT_STYLE_ALIASES } from "./core/PartsManagers/MergeManager";
 export type { AppendOptions } from "./core/PartsManagers/MergeManager";
 export { default as Paragraph } from "./core/files/paragraph/index";

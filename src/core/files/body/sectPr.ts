@@ -147,6 +147,130 @@ export function upsertSectPrVAlign(
   return sectPrXml.slice(0, openEnd) + insertBySchemaOrder(inner, "w:vAlign", tag) + sectPrXml.slice(close);
 }
 
+/**
+ * Apply `edit` to a `<w:sectPr>`'s INNER xml (a self-closing `<w:sectPr/>` is
+ * expanded first). Everything outside the inner stays byte-identical.
+ */
+function editSectPrInner(sectPrXml: string, edit: (inner: string) => string): string {
+  const m = /<w:sectPr\b[^>]*?(\/?)>/.exec(sectPrXml);
+  if (!m) return sectPrXml;
+  if (m[1] === "/") {
+    const next = edit("");
+    if (next === "") return sectPrXml;
+    const openTag = m[0].slice(0, m[0].length - 2) + ">";
+    return sectPrXml.slice(0, m.index) + openTag + next + "</w:sectPr>" + sectPrXml.slice(m.index + m[0].length);
+  }
+  const openEnd = m.index + m[0].length;
+  const close = sectPrXml.indexOf("</w:sectPr>", openEnd);
+  if (close === -1) return sectPrXml;
+  const inner = sectPrXml.slice(openEnd, close);
+  const next = edit(inner);
+  return next === inner ? sectPrXml : sectPrXml.slice(0, openEnd) + next + sectPrXml.slice(close);
+}
+
+/** Page geometry in twips. `orient` is written as given: swapping width/height is the caller's job. */
+export interface SectPrGeometry {
+  widthTw?: number;
+  heightTw?: number;
+  orient?: "portrait" | "landscape";
+  topTw?: number;
+  bottomTw?: number;
+  leftTw?: number;
+  rightTw?: number;
+  gutterTw?: number;
+  headerTw?: number;
+  footerTw?: number;
+}
+
+const PGMAR_DEFAULTS: Record<string, string> = {
+  "w:top": "1440", "w:right": "1440", "w:bottom": "1440", "w:left": "1440",
+  "w:header": "720", "w:footer": "720", "w:gutter": "0",
+};
+
+function twipAttr(v: number, what: string): string {
+  if (!Number.isFinite(v) || v < 0) throw new Error(`setSectionGeometry: ${what} must be a non-negative number of twips, got ${v}`);
+  return String(Math.round(v));
+}
+
+/** Set attributes on the first `<tag …/>` (keeping every other attribute), or null if absent. */
+function setAttrsOn(inner: string, tag: string, set: Record<string, string>): string | null {
+  const re = new RegExp(`<${escRe(tag)}(?=[\\s/>])([^>]*?)(/?)>`);
+  const m = re.exec(inner);
+  if (!m) return null;
+  let attrs = m[1];
+  for (const [k, v] of Object.entries(set)) {
+    const aRe = new RegExp(`(\\s${escRe(k)}=)(["'])[^"']*\\2`);
+    attrs = aRe.test(attrs) ? attrs.replace(aRe, `$1"${v}"`) : `${attrs} ${k}="${v}"`;
+  }
+  const out = `<${tag}${attrs}${m[2]}>`;
+  return out === m[0] ? inner : inner.slice(0, m.index) + out + inner.slice(m.index + m[0].length);
+}
+
+/**
+ * Upsert `<w:pgSz>` / `<w:pgMar>` on one `<w:sectPr>` string: only the named
+ * attributes change, the rest of an existing element (`w:code`, …) is kept, and a
+ * brand-new `pgMar` is completed with Word's defaults for its required attributes.
+ */
+export function upsertSectPrGeometry(sectPrXml: string, g: SectPrGeometry): string {
+  const sz: Record<string, string> = {};
+  if (g.widthTw !== undefined) sz["w:w"] = twipAttr(g.widthTw, "widthTw");
+  if (g.heightTw !== undefined) sz["w:h"] = twipAttr(g.heightTw, "heightTw");
+  if (g.orient !== undefined) sz["w:orient"] = g.orient;
+  const mar: Record<string, string> = {};
+  if (g.topTw !== undefined) mar["w:top"] = twipAttr(g.topTw, "topTw");
+  if (g.bottomTw !== undefined) mar["w:bottom"] = twipAttr(g.bottomTw, "bottomTw");
+  if (g.leftTw !== undefined) mar["w:left"] = twipAttr(g.leftTw, "leftTw");
+  if (g.rightTw !== undefined) mar["w:right"] = twipAttr(g.rightTw, "rightTw");
+  if (g.gutterTw !== undefined) mar["w:gutter"] = twipAttr(g.gutterTw, "gutterTw");
+  if (g.headerTw !== undefined) mar["w:header"] = twipAttr(g.headerTw, "headerTw");
+  if (g.footerTw !== undefined) mar["w:footer"] = twipAttr(g.footerTw, "footerTw");
+
+  return editSectPrInner(sectPrXml, (inner) => {
+    let out = inner;
+    if (Object.keys(sz).length) {
+      const edited = setAttrsOn(out, "w:pgSz", sz);
+      if (edited !== null) out = edited;
+      else {
+        if (sz["w:w"] === undefined || sz["w:h"] === undefined) {
+          throw new Error("setSectionGeometry: the section has no w:pgSz, so widthTw and heightTw must both be given");
+        }
+        out = insertBySchemaOrder(out, "w:pgSz", `<w:pgSz w:w="${sz["w:w"]}" w:h="${sz["w:h"]}"${sz["w:orient"] ? ` w:orient="${sz["w:orient"]}"` : ""}/>`);
+      }
+    }
+    if (Object.keys(mar).length) {
+      const edited = setAttrsOn(out, "w:pgMar", mar);
+      if (edited !== null) out = edited;
+      else {
+        const all = { ...PGMAR_DEFAULTS, ...mar };
+        const order = ["w:top", "w:right", "w:bottom", "w:left", "w:header", "w:footer", "w:gutter"];
+        out = insertBySchemaOrder(out, "w:pgMar", `<w:pgMar ${order.map((k) => `${k}="${all[k]}"`).join(" ")}/>`);
+      }
+    }
+    return out;
+  });
+}
+
+/** Remove `<w:titlePg>` (the "different first page" switch) from one sectPr. */
+export function removeSectPrTitlePg(sectPrXml: string): string {
+  return editSectPrInner(sectPrXml, (inner) =>
+    inner.replace(/<w:titlePg\b[^>]*\/>|<w:titlePg\b[^>]*>[\s\S]*?<\/w:titlePg>/g, ""),
+  );
+}
+
+/** Remove every header/footer reference from one sectPr (the parts themselves are not touched). */
+export function removeSectPrHeaderFooterRefs(sectPrXml: string): string {
+  return editSectPrInner(sectPrXml, (inner) =>
+    inner.replace(/<w:(?:header|footer)Reference\b[^>]*\/>/g, ""),
+  );
+}
+
+/** The `<w:pgSz>` + `<w:pgMar>` elements of a sectPr, verbatim ("" when absent). */
+export function extractSectPrGeometry(sectPrXml: string): string {
+  const pick = (tag: string) =>
+    new RegExp(`<${escRe(tag)}(?=[\\s/>])[^>]*?/>`).exec(sectPrXml)?.[0] ?? "";
+  return pick("w:pgSz") + pick("w:pgMar");
+}
+
 export interface SectPrPageBorderOptions {
   style: "single" | "double" | "thick" | "dashed" | "dotted";
   /** 6-hex, with or without a leading '#'. */

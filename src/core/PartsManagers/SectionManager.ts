@@ -10,6 +10,11 @@ import {
   editBodySectPr,
   upsertSectPrVAlign,
   upsertSectPrPageBorders,
+  upsertSectPrGeometry,
+  removeSectPrTitlePg,
+  removeSectPrHeaderFooterRefs,
+  extractSectPrGeometry,
+  type SectPrGeometry,
   type SectPrPageBorderOptions,
 } from "@/core/files/body/sectPr";
 
@@ -241,6 +246,7 @@ export class SectionManager {
   public async addSectionBreak(
     paragraphIndex: number,
     type: "nextPage" | "continuous" | "evenPage" | "oddPage",
+    opts: { copyBodyGeometry?: boolean } = {},
   ): Promise<void> {
     const xml = this.zip.readAsText(DOCUMENT_PATH);
     if (!xml) throw new Error("word/document.xml not found");
@@ -248,7 +254,11 @@ export class SectionManager {
     const paraBlocks = split.blocks.filter((b) => b.kind === "paragraph");
     if (!paraBlocks.length) return;
     const idx = Math.max(0, Math.min(paragraphIndex, paraBlocks.length - 1));
-    const sectPr = `<w:sectPr><w:type w:val="${type}"/></w:sectPr>`;
+    // A bare `<w:type>` makes the section fall back to Word's default page
+    // (Letter), so the break carries the body section's page size and margins.
+    const bodySect = split.blocks.find((b) => b.kind === "sectPr");
+    const geometry = opts.copyBodyGeometry === false || !bodySect ? "" : extractSectPrGeometry(bodySect.xml);
+    const sectPr = `<w:sectPr><w:type w:val="${type}"/>${geometry}</w:sectPr>`;
     paraBlocks[idx].xml = upsertParagraphSectPr(paraBlocks[idx].xml, sectPr);
     this.zip.addFile(DOCUMENT_PATH, Buffer.from(assembleDocument(split), "utf-8"));
   }
@@ -269,6 +279,24 @@ export class SectionManager {
     this.applyLayout(sectPr, layout);
     if (isBody) obj["w:document"]["w:body"]["w:sectPr"] = sectPr;
     await this.writeDocument(obj);
+  }
+
+  /**
+   * Set ONE section's page size and margins (`pgSz` / `pgMar`), byte-safe: only
+   * the named attributes change. Width/height are NOT swapped for `orient`.
+   */
+  public async setSectionGeometry(sectionIndex: number, geometry: SectPrGeometry): Promise<void> {
+    await this.editSectionSectPr(sectionIndex, (s) => upsertSectPrGeometry(s, geometry));
+  }
+
+  /** Remove `w:titlePg` ("different first page") from ONE section. */
+  public async removeTitlePg(sectionIndex: number): Promise<void> {
+    await this.editSectionSectPr(sectionIndex, removeSectPrTitlePg);
+  }
+
+  /** Drop every header/footer reference from ONE section's sectPr (the parts are left alone). */
+  public async removeSectionHeaderFooterRefs(sectionIndex: number): Promise<void> {
+    await this.editSectionSectPr(sectionIndex, removeSectPrHeaderFooterRefs);
   }
 
   public async setSectionHeader(
