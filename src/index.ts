@@ -22,6 +22,7 @@ import { SectionManager } from "./core/PartsManagers/SectionManager";
 import { ShapeManager } from "./core/PartsManagers/ShapeManager";
 import { MergeManager } from "./core/PartsManagers/MergeManager";
 import { FormattingManager } from "./core/PartsManagers/FormattingManager";
+import { FontTableManager } from "./core/PartsManagers/FontTableManager";
 import type { PageNumberFormat } from "./core/PartsManagers/FooterManager";
 import fs from "fs/promises";
 import path from "path";
@@ -67,6 +68,7 @@ class Mdocxengine {
   shapes: ShapeManager;
   merge: MergeManager;
   formatting: FormattingManager;
+  fontTable: FontTableManager;
 
   private constructor(zip: ZipManager) {
     this.zip = zip;
@@ -93,6 +95,7 @@ class Mdocxengine {
     this.shapes         = new ShapeManager(zip);
     this.merge          = new MergeManager(zip);
     this.formatting     = new FormattingManager(zip);
+    this.fontTable      = new FontTableManager(zip, this.contentTypes);
   }
 
   static async loadFromFile(path: string) {
@@ -255,6 +258,11 @@ export {
   MergeManager,
   FormattingManager,
 };
+export { FontTableManager, appendRel } from "./core/PartsManagers/FontTableManager";
+export type { EmbedFontInput, EmbedFontResult, FontVariant } from "./core/PartsManagers/FontTableManager";
+export { readFsType, embeddingPermission, canEmbed } from "./core/fonts/fsType";
+export type { EmbeddingPermission } from "./core/fonts/fsType";
+export { obfuscateFont, fontKeyBytes, newFontKey } from "./core/fonts/obfuscate";
 export type {
   DocumentFormatting,
   DocumentMargins,
