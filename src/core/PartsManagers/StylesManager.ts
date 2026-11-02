@@ -3,6 +3,10 @@ import AdmZip from "adm-zip";
 import { canonicalizeRunProps, canonicalizeStyleChildren } from "@/core/ooxml/canonicalOrder";
 import { mergeRunProps, type RunProps } from "@/core/ooxml/runProps";
 import { toHalfPoints } from "@/core/ooxml/hps";
+import { applyParaStyleProps, type ParaStyleProps } from "@/core/ooxml/styleProps";
+import { splitTopLevelElements, elementName } from "@/core/ooxml/canonicalOrder";
+
+export type { ParaStyleProps } from "@/core/ooxml/styleProps";
 
 const STYLES_PATH = "word/styles.xml";
 
@@ -198,6 +202,163 @@ export function applyStyleRunPropsToXml(
   return { xml, created, updated: true };
 }
 
+
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const styleBlockRe = (styleId: string) =>
+  new RegExp(`<w:style\\b[^>]*w:styleId="${escapeRe(styleId)}"[^>]*>[\\s\\S]*?<\\/w:style>`);
+
+/**
+ * Pure transform: apply paragraph `props` to the `<w:pPr>` of `styleId`, creating
+ * the style first when `ensure` is supplied and it is missing. String surgery
+ * only — every byte outside the one style's `pPr` is untouched.
+ */
+export function applyStyleParagraphPropsToXml(
+  stylesXml: string,
+  styleId: string,
+  props: ParaStyleProps,
+  ensure?: EnsureStyleSpec,
+): { xml: string; created: boolean; updated: boolean } {
+  let xml = stylesXml;
+  let created = false;
+  const re = styleBlockRe(styleId);
+  if (!re.test(xml)) {
+    if (!ensure) return { xml, created: false, updated: false };
+    const fresh = buildParagraphStyleXml(styleId, ensure.name, { basedOn: ensure.basedOn, isDefault: ensure.isDefault });
+    xml = xml.replace(/<\/w:styles>\s*$/, `${fresh}</w:styles>`);
+    created = true;
+  }
+  const match = re.exec(xml);
+  if (!match) return { xml, created, updated: false };
+
+  const block = match[0];
+  const parts = /^(<w:style\b[^>]*>)([\s\S]*)(<\/w:style>)$/.exec(block);
+  if (!parts) return { xml, created, updated: false };
+  const children = splitTopLevelElements(parts[2]);
+  const at = children.findIndex((c) => elementName(c) === "w:pPr");
+  const current = at === -1 ? "" : (/^<w:pPr(?:\s[^>]*)?>([\s\S]*)<\/w:pPr>$/.exec(children[at])?.[1] ?? "");
+  const next = applyParaStyleProps(current, props);
+  const pPr = next ? `<w:pPr>${next}</w:pPr>` : "";
+
+  let rebuilt: string;
+  if (at !== -1) {
+    if (children[at] === pPr) return { xml, created, updated: false };
+    children[at] = pPr;
+    rebuilt = children.join("");
+  } else if (pPr) {
+    rebuilt = canonicalizeStyleChildren(`${parts[2]}${pPr}`);
+  } else {
+    return { xml, created, updated: false };
+  }
+  const out = parts[1] + rebuilt + parts[3];
+  xml = xml.slice(0, match.index) + out + xml.slice(match.index + block.length);
+  return { xml, created, updated: true };
+}
+
+/** How `ensureStyle` creates a style that is missing. */
+export interface EnsureStyleOptions {
+  name: string;
+  type: "paragraph" | "character";
+  basedOn?: string;
+  next?: string;
+  uiPriority?: number;
+  qFormat?: boolean;
+}
+
+/**
+ * Pure transform: add a minimal style when `styleId` is missing. An existing
+ * style is NEVER modified (not even to make it match `spec`).
+ */
+export function applyEnsureStyleToXml(
+  stylesXml: string,
+  styleId: string,
+  spec: EnsureStyleOptions,
+): { xml: string; created: boolean } {
+  if (styleBlockRe(styleId).test(stylesXml) || !/<\/w:styles>\s*$/.test(stylesXml)) {
+    return { xml: stylesXml, created: false };
+  }
+  const fresh =
+    `<w:style w:type="${spec.type}" w:styleId="${styleId}"><w:name w:val="${spec.name}"/>` +
+    (spec.basedOn ? `<w:basedOn w:val="${spec.basedOn}"/>` : "") +
+    (spec.next ? `<w:next w:val="${spec.next}"/>` : "") +
+    (spec.uiPriority !== undefined ? `<w:uiPriority w:val="${spec.uiPriority}"/>` : "") +
+    (spec.qFormat ? "<w:qFormat/>" : "") +
+    `</w:style>`;
+  return { xml: stylesXml.replace(/<\/w:styles>\s*$/, `${fresh}</w:styles>`), created: true };
+}
+
+export interface DocDefaultsInput {
+  fontLatin?: string;
+  fontCs?: string;
+  sizePt?: number;
+  sizeCsPt?: number;
+  lang?: { val?: string; bidi?: string };
+  /** Multiple of single line spacing. */
+  lineSpacing?: number;
+  afterPt?: number;
+}
+
+/**
+ * Pure transform: write document defaults into `<w:docDefaults>` (created as the
+ * first child of `<w:styles>` when absent), creating `rPrDefault` / `pPrDefault`
+ * as needed. Only the named properties change.
+ */
+export function applyDocDefaultsToXml(
+  stylesXml: string,
+  d: DocDefaultsInput,
+): { xml: string; updated: boolean } {
+  const runProps: RunProps = {};
+  if (d.fontLatin !== undefined) runProps.fontLatin = d.fontLatin;
+  if (d.fontCs !== undefined) runProps.fontCs = d.fontCs;
+  if (d.sizePt !== undefined) runProps.sizePt = d.sizePt;
+  if (d.sizeCsPt !== undefined) runProps.sizeCsPt = d.sizeCsPt;
+  const wantsRun = Object.keys(runProps).length > 0 || d.lang !== undefined;
+  const paraProps: ParaStyleProps = {};
+  if (d.lineSpacing !== undefined) paraProps.lineSpacing = d.lineSpacing;
+  if (d.afterPt !== undefined) paraProps.afterPt = d.afterPt;
+  const wantsPara = Object.keys(paraProps).length > 0;
+  if (!wantsRun && !wantsPara) return { xml: stylesXml, updated: false };
+
+  // Locate (or plan to create) docDefaults.
+  const dd = /<w:docDefaults\s*\/>|<w:docDefaults(?:\s[^>]*)?>([\s\S]*?)<\/w:docDefaults>/.exec(stylesXml);
+  let inner = dd?.[1] ?? "";
+
+  const upsertDefault = (wrapper: "w:rPrDefault" | "w:pPrDefault", leaf: "w:rPr" | "w:pPr", edit: (leafInner: string) => string) => {
+    const wRe = new RegExp(`<${wrapper}\\s*/>|<${wrapper}(?:\\s[^>]*)?>([\\s\\S]*?)</${wrapper}>`);
+    const w = wRe.exec(inner);
+    const wInner = w?.[1] ?? "";
+    const lRe = new RegExp(`<${leaf}\\s*/>|<${leaf}(?:\\s[^>]*)?>([\\s\\S]*?)</${leaf}>`);
+    const l = lRe.exec(wInner);
+    const newLeaf = `<${leaf}>${edit(l?.[1] ?? "")}</${leaf}>`;
+    const newWrapperInner = l ? wInner.replace(l[0], newLeaf) : wInner + newLeaf;
+    const newWrapper = `<${wrapper}>${newWrapperInner}</${wrapper}>`;
+    if (w) inner = inner.replace(w[0], newWrapper);
+    else inner = wrapper === "w:rPrDefault" ? newWrapper + inner : inner + newWrapper;
+  };
+
+  if (wantsRun) {
+    upsertDefault("w:rPrDefault", "w:rPr", (rpr) => {
+      let out = Object.keys(runProps).length ? mergeRunProps(rpr, runProps) : rpr;
+      if (d.lang) {
+        const m = /<w:lang(?=[\s/>])([^>]*?)\/?>/.exec(out);
+        const attrs = new Map<string, string>();
+        if (m) for (const a of m[1].matchAll(/\s(w:\w+)=["']([^"']*)["']/g)) attrs.set(a[1], a[2]);
+        if (d.lang.val !== undefined) attrs.set("w:val", d.lang.val);
+        if (d.lang.bidi !== undefined) attrs.set("w:bidi", d.lang.bidi);
+        const tag = `<w:lang${[...attrs].map(([k, v]) => ` ${k}="${v}"`).join("")}/>`;
+        out = canonicalizeRunProps((m ? out.replace(m[0], "") : out) + tag);
+      }
+      return out;
+    });
+  }
+  if (wantsPara) upsertDefault("w:pPrDefault", "w:pPr", (ppr) => applyParaStyleProps(ppr, paraProps));
+
+  const block = `<w:docDefaults>${inner}</w:docDefaults>`;
+  let xml: string;
+  if (dd) xml = stylesXml.replace(dd[0], block);
+  else xml = stylesXml.replace(/(<w:styles\b[^>]*>)/, `$1${block}`);
+  return { xml, updated: xml !== stylesXml };
+}
+
 export class StylesManager {
   private zip: AdmZip;
 
@@ -305,5 +466,33 @@ export class StylesManager {
     const { xml: out, created, updated } = applyStyleRunPropsToXml(xml, styleId, props, ensure);
     if (created || updated) this.zip.addFile(STYLES_PATH, Buffer.from(out, "utf-8"));
     return { created, updated };
+  }
+
+  /** Write paragraph properties onto a style's `pPr` (string surgery). */
+  public async setStyleParagraphProps(
+    styleId: string,
+    props: ParaStyleProps,
+    ensure?: EnsureStyleSpec,
+  ): Promise<{ created: boolean; updated: boolean }> {
+    const xml = this.zip.readAsText(STYLES_PATH) ?? "";
+    const r = applyStyleParagraphPropsToXml(xml, styleId, props, ensure);
+    if (r.created || r.updated) this.zip.addFile(STYLES_PATH, Buffer.from(r.xml, "utf-8"));
+    return { created: r.created, updated: r.updated };
+  }
+
+  /** Write `w:docDefaults` (fonts, sizes, language, line spacing). */
+  public async setDocDefaults(d: DocDefaultsInput): Promise<{ updated: boolean }> {
+    const xml = this.zip.readAsText(STYLES_PATH) ?? "";
+    const r = applyDocDefaultsToXml(xml, d);
+    if (r.updated) this.zip.addFile(STYLES_PATH, Buffer.from(r.xml, "utf-8"));
+    return { updated: r.updated };
+  }
+
+  /** Create `styleId` if missing. NEVER modifies an existing style. */
+  public async ensureStyle(styleId: string, spec: EnsureStyleOptions): Promise<{ created: boolean }> {
+    const xml = this.zip.readAsText(STYLES_PATH) ?? "";
+    const r = applyEnsureStyleToXml(xml, styleId, spec);
+    if (r.created) this.zip.addFile(STYLES_PATH, Buffer.from(r.xml, "utf-8"));
+    return { created: r.created };
   }
 }

@@ -10,8 +10,17 @@ import { toHalfPoints } from "./hps";
 export interface RunProps {
   /** Font family. Written to `w:ascii`, `w:hAnsi` AND `w:cs`. */
   font?: string;
-  /** Size in POINTS. Written as half-points to BOTH `w:sz` and `w:szCs`. */
+  /** Latin font only: `w:ascii` + `w:hAnsi`. Wins over `font` for those two. */
+  fontLatin?: string;
+  /** Complex-script (Arabic) font only: `w:cs`. Wins over `font` for `w:cs`. */
+  fontCs?: string;
+  /**
+   * Size in POINTS. Written as half-points to BOTH `w:sz` and `w:szCs` — unless
+   * `sizeCsPt` is also given, in which case this is `w:sz` only.
+   */
   sizePt?: number;
+  /** Complex-script size in POINTS: `w:szCs` only. */
+  sizeCsPt?: number;
   /** true writes `<w:b/><w:bCs/>`; false removes both. */
   bold?: boolean;
   /** true writes `<w:i/><w:iCs/>`; false removes both. */
@@ -27,7 +36,10 @@ export interface RunProps {
  */
 export const RUN_PROP_TAGS: Record<keyof RunProps, readonly string[]> = {
   font: ["rFonts"],
+  fontLatin: ["rFonts"],
+  fontCs: ["rFonts"],
   sizePt: ["sz", "szCs"],
+  sizeCsPt: ["szCs"],
   bold: ["b", "bCs"],
   italic: ["i", "iCs"],
   color: ["color"],
@@ -54,6 +66,39 @@ export function buildRFonts(font: string, existing?: string): string {
   }
   const tail = kept.length ? ` ${kept.join(" ")}` : "";
   return `<w:rFonts w:ascii="${font}" w:hAnsi="${font}" w:cs="${font}"${tail}/>`;
+}
+
+/**
+ * `<w:rFonts>` for a PARTIAL font write (`fontLatin` and/or `fontCs`, optionally
+ * on top of `font`). Unlike {@link buildRFonts} it keeps EVERY attribute of the
+ * element being replaced that is not being overwritten — writing only the cs
+ * font must not disturb the Latin one. A theme attribute that would override an
+ * explicit font it shadows (`asciiTheme` over `ascii`, `cstheme` over `cs`) is
+ * dropped, or the new font would be silently ignored.
+ */
+export function buildPartialRFonts(
+  fonts: { font?: string; fontLatin?: string; fontCs?: string },
+  existing?: string,
+): string {
+  const attrs = new Map<string, string>();
+  if (existing) {
+    for (const m of existing.matchAll(/\s(w:[\w]+)=["']([^"']*)["']/g)) attrs.set(m[1], m[2]);
+  }
+  const latin = fonts.fontLatin ?? fonts.font;
+  const cs = fonts.fontCs ?? fonts.font;
+  if (latin !== undefined) {
+    attrs.set("w:ascii", latin);
+    attrs.set("w:hAnsi", latin);
+    attrs.delete("w:asciiTheme");
+    attrs.delete("w:hAnsiTheme");
+  }
+  if (cs !== undefined) {
+    attrs.set("w:cs", cs);
+    attrs.delete("w:cstheme");
+  }
+  const order = ["w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"];
+  const keys = [...order.filter((k) => attrs.has(k)), ...[...attrs.keys()].filter((k) => !order.includes(k))];
+  return `<w:rFonts ${keys.map((k) => `${k}="${attrs.get(k)}"`).join(" ")}/>`;
 }
 
 /** The `w:rPr` child tags owned by the properties present on `props`. */
@@ -93,11 +138,23 @@ export function mergeRunProps(rPrInner: string, props: RunProps): string {
   let body = rPrInner;
   const added: string[] = [];
 
-  if (props.font !== undefined) {
+  if (props.fontLatin !== undefined || props.fontCs !== undefined) {
+    body = stripRunPropTags(body, RUN_PROP_TAGS.font);
+    added.push(buildPartialRFonts(props, existingRFonts));
+  } else if (props.font !== undefined) {
     body = stripRunPropTags(body, RUN_PROP_TAGS.font);
     added.push(buildRFonts(props.font, existingRFonts));
   }
-  if (props.sizePt !== undefined) {
+  if (props.sizePt !== undefined && props.sizeCsPt !== undefined) {
+    const sz = toHalfPoints(props.sizePt, "runProps.mergeRunProps sizePt");
+    const szCs = toHalfPoints(props.sizeCsPt, "runProps.mergeRunProps sizeCsPt");
+    body = stripRunPropTags(body, RUN_PROP_TAGS.sizePt);
+    added.push(`<w:sz w:val="${sz}"/><w:szCs w:val="${szCs}"/>`);
+  } else if (props.sizeCsPt !== undefined) {
+    const szCs = toHalfPoints(props.sizeCsPt, "runProps.mergeRunProps sizeCsPt");
+    body = stripRunPropTags(body, RUN_PROP_TAGS.sizeCsPt);
+    added.push(`<w:szCs w:val="${szCs}"/>`);
+  } else if (props.sizePt !== undefined) {
     // w:sz/w:szCs are ST_HpsMeasure (unsigned WHOLE half-points) - a negative,
     // zero, fractional, NaN or Infinite value is schema-invalid OOXML, and a
     // fraction of a point is text Word paints too small to see. Fail loudly

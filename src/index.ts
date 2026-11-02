@@ -464,8 +464,14 @@ export {
 } from "./core/ooxml/drawingLayout";
 export {
   applyStyleRunPropsToXml,
+  applyStyleParagraphPropsToXml,
+  applyDocDefaultsToXml,
+  applyEnsureStyleToXml,
   buildParagraphStyleXml,
   type EnsureStyleSpec,
+  type EnsureStyleOptions,
+  type DocDefaultsInput,
+  type ParaStyleProps,
 } from "./core/PartsManagers/StylesManager";
 
 // ── Document doctor ──────────────────────────────────────────────────────────
