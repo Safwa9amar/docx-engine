@@ -11,6 +11,10 @@
  * resolve against THIS document:
  *   - images   → copied into word/media (new rId via MediaManager.insertImage)
  *   - footnotes→ copied into word/footnotes.xml (new id via FootnoteManager)
+ *   - endnotes → copied into word/endnotes.xml (new id via EndnoteManager)
+ *   - comments → NOT copied. Their anchors are stripped and counted: a thesis going
+ *                to deposit never carries them, and a `w:commentReference` left with
+ *                no comments part behind it makes Word refuse the file.
  *   - styles   → retargeted to this document's styles by name (caller-supplied
  *                map); the combine flow normalizes everything to one profile, so
  *                source style DEFINITIONS are intentionally not imported.
@@ -29,6 +33,7 @@ import AdmZip from "adm-zip";
 import DocumentManager from "./DocumentManager";
 import { MediaManager } from "./MediaManager";
 import { FootnoteManager } from "./FootnoteManager";
+import { EndnoteManager } from "./EndnoteManager";
 import { NumberingManager } from "./NumberingManager";
 import { RelManager } from "./RelManager";
 import { ContentTypesManager } from "./ContentTypesManager";
@@ -92,6 +97,64 @@ function partRelsPath(part: string): string {
   return `${part.slice(0, i)}/_rels/${part.slice(i + 1)}.rels`;
 }
 
+type NoteKind = "footnote" | "endnote";
+const NOTE_KINDS: NoteKind[] = ["footnote", "endnote"];
+
+/** The note ids a stretch of body XML refers to. */
+function noteRefIds(xml: string, kind: NoteKind): Set<string> {
+  return new Set([...xml.matchAll(new RegExp(`<w:${kind}Reference\\b[^>]*\\bw:id="([^"]+)"`, "g"))].map((m) => m[1]));
+}
+
+// ─── Comment markup ─────────────────────────────────────────────────────────
+
+const COMMENT_MARK_ID = /<w:comment(?:RangeStart|RangeEnd|Reference)\b[^>]*\bw:id="([^"]*)"/g;
+/** A run that holds the reference and nothing else (an rPr aside) goes with it. */
+const COMMENT_ONLY_RUN =
+  /<w:r(?:\s[^>]*)?>\s*(?:<w:rPr(?:\s[^>]*)?\/>|<w:rPr(?:\s[^>]*)?>(?:(?!<\/w:rPr>)[\s\S])*<\/w:rPr>)?\s*<w:commentReference\b[^>]*?(?:\/>|>\s*<\/w:commentReference>)\s*<\/w:r>/g;
+const COMMENT_MARK = /<w:comment(RangeStart|RangeEnd|Reference)\b[^>]*?(?:\/>|>\s*<\/w:comment\1>)/g;
+
+/** `xml` with every comment anchor gone, nothing else changed; their ids land in `ids`. */
+function stripCommentMarks(xml: string, ids: Set<string>): string {
+  if (!xml.includes("<w:comment")) return xml;
+  for (const m of xml.matchAll(COMMENT_MARK_ID)) ids.add(m[1]);
+  return xml.replace(COMMENT_ONLY_RUN, "").replace(COMMENT_MARK, "");
+}
+
+/** Blocks with their comment anchors gone. A block that was nothing BUT an anchor (a
+ *  range mark standing between paragraphs) goes too; every other block keeps its bytes. */
+function stripCommentMarksFromBlocks(blocks: BodyBlock[], ids: Set<string>): BodyBlock[] {
+  const out: BodyBlock[] = [];
+  for (const b of blocks) {
+    const xml = stripCommentMarks(b.xml, ids);
+    if (xml === b.xml) out.push(b);
+    else if (xml.trim()) out.push({ ...b, xml });
+  }
+  return out;
+}
+
+/** The ids of the comments a comments part defines. */
+function definedCommentIds(commentsXml: string | null | undefined, ids: Set<string>): void {
+  if (!commentsXml) return;
+  for (const m of commentsXml.matchAll(/<w:comment\b[^>]*\bw:id="([^"]*)"/g)) ids.add(m[1]);
+}
+
+const COMMENT_PART = /^word\/comments(?:Extended|Ids|Extensible)?\.xml$/i;
+const COMMENT_REL_TYPE = /\/comments(?:Extended|Ids|Extensible)?$/i;
+/** Stories that could hold an anchor besides the body. Word's UI only puts them in
+ *  notes, but the schema allows any run, and one left behind makes Word refuse the file. */
+const COMMENTABLE_PART = /^word\/(?:footnotes|endnotes|header\d*|footer\d*)\.xml$/;
+const RELATIONSHIP_ELEMENT = /<Relationship\b[^>]*?(?:\/>|>\s*<\/Relationship>)/g;
+const attrOf = (tag: string, name: string) => new RegExp(`\\b${name}="([^"]*)"`).exec(tag)?.[1];
+
+/** A part's identity across rels files: Targets may be percent-encoded or differ in case. */
+function partKey(path: string): string {
+  try {
+    return decodeURIComponent(path).toLowerCase();
+  } catch {
+    return path.toLowerCase();
+  }
+}
+
 interface IdPlan {
   nextDoc: () => number;
   bmIds: Map<string, string>;
@@ -105,6 +168,11 @@ export interface AppendOptions {
   leadingBlocks?: BodyBlock[];
   /** source styleId → target styleId (applied to `<w:pStyle w:val>`). */
   styleMap?: Record<string, string>;
+}
+
+export interface AppendResult {
+  /** Comments the source carried, none of which came across. */
+  commentsStripped: number;
 }
 
 /**
@@ -132,6 +200,7 @@ export class MergeManager {
   private document: DocumentManager;
   private media: MediaManager;
   private footnotes: FootnoteManager;
+  private endnotes: EndnoteManager;
   private numbering: NumberingManager;
   private rels: RelManager;
   private contentTypes: ContentTypesManager;
@@ -141,6 +210,7 @@ export class MergeManager {
     this.document = new DocumentManager(zip);
     this.media = new MediaManager(zip);
     this.footnotes = new FootnoteManager(zip);
+    this.endnotes = new EndnoteManager(zip);
     this.numbering = new NumberingManager(zip);
     this.rels = new RelManager(zip);
     this.contentTypes = new ContentTypesManager(zip);
@@ -149,15 +219,19 @@ export class MergeManager {
   /**
    * Copy `sourceBuffer`'s body into this document, fully remapped, appended after
    * the existing body (before the trailing sectPr, handled by saveBlocks).
+   * The source's comments do not come across; the result counts them. Comments
+   * already in THIS document are left alone: see `stripComments`.
    */
-  async appendDocument(sourceBuffer: Buffer, opts: AppendOptions = {}): Promise<void> {
+  async appendDocument(sourceBuffer: Buffer, opts: AppendOptions = {}): Promise<AppendResult> {
     const { Mdocxengine } = await import("@/index");
     const source = (await (Mdocxengine as typeof MdocxengineType).loadFromBuffer(
       sourceBuffer,
     )) as MdocxengineType;
 
-    const srcBlocks = await source.document.getBlocks();
-    const remapped = await this.remapBlocks(source, srcBlocks, opts.styleMap ?? {});
+    const commentIds = new Set<string>();
+    definedCommentIds(source.zip.readAsText("word/comments.xml"), commentIds);
+    const srcBlocks = stripCommentMarksFromBlocks(await source.document.getBlocks(), commentIds);
+    const remapped = await this.remapBlocks(source, srcBlocks, opts.styleMap ?? {}, commentIds);
 
     const existing = await this.document.getBlocks();
     const prefix: BodyBlock[] = [];
@@ -166,6 +240,94 @@ export class MergeManager {
 
     await this.document.saveBlocks([...existing, ...prefix, ...remapped]);
     this.carryNamespaces(source);
+    return { commentsStripped: commentIds.size };
+  }
+
+  // ─── Comments ───────────────────────────────────────────────────────────────
+
+  /**
+   * Remove every comment from THIS document and return how many it had: the
+   * anchors in the body and the notes, the comment parts with their relationships
+   * and content types, and any picture only a comment used. Everything else keeps
+   * its exact bytes; a document with no comments is not rewritten at all.
+   */
+  async stripComments(): Promise<number> {
+    const ids = new Set<string>();
+    definedCommentIds(this.zip.readAsText("word/comments.xml"), ids);
+
+    const blocks = await this.document.getBlocks();
+    const bare = stripCommentMarksFromBlocks(blocks, ids);
+    if (bare.length !== blocks.length || bare.some((b, i) => b !== blocks[i])) {
+      await this.document.saveBlocks(bare);
+    }
+    for (const name of this.zip.getEntries().map((e) => e.entryName).filter((n) => COMMENTABLE_PART.test(n))) {
+      const xml = this.zip.readAsText(name);
+      const stripped = stripCommentMarks(xml, ids);
+      if (stripped !== xml) this.zip.addFile(name, Buffer.from(stripped, "utf8"));
+    }
+    this.removeCommentParts();
+    return ids.size;
+  }
+
+  /** Delete the comment parts and everything that names them, by string surgery. */
+  private removeCommentParts(): void {
+    const names = this.zip.getEntries().map((e) => e.entryName);
+    const parts = new Set(names.filter((n) => COMMENT_PART.test(n)));
+
+    const relsXml = this.zip.readAsText(SRC_RELS_PATH);
+    if (relsXml) {
+      const kept = relsXml.replace(RELATIONSHIP_ELEMENT, (rel) => {
+        const target = attrOf(rel, "Target");
+        if (!target || !COMMENT_REL_TYPE.test(attrOf(rel, "Type") ?? "")) return rel;
+        parts.add(resolvePartPath("word/document.xml", target));
+        return "";
+      });
+      if (kept !== relsXml) this.zip.addFile(SRC_RELS_PATH, Buffer.from(kept, "utf8"));
+    }
+    if (parts.size === 0) return;
+
+    const dependants = [...parts].flatMap((part) => this.internalTargets(partRelsPath(part)));
+    const doomed = new Set(parts);
+    for (const part of parts) doomed.add(partRelsPath(part));
+    for (const part of doomed) if (this.zip.getEntry(part)) this.zip.deleteFile(part);
+
+    // What only a comment pointed at (a pasted picture) must not stay behind in the
+    // package; anything another part still reaches stays.
+    const reached = new Set(
+      this.zip
+        .getEntries()
+        .map((e) => e.entryName)
+        .filter((n) => n.endsWith(".rels"))
+        .flatMap((n) => this.internalTargets(n))
+        .map(partKey),
+    );
+    for (const dep of dependants) {
+      if (reached.has(partKey(dep)) || !this.zip.getEntry(dep)) continue;
+      this.zip.deleteFile(dep);
+      doomed.add(dep);
+    }
+
+    const contentTypes = this.zip.readAsText("[Content_Types].xml");
+    if (contentTypes) {
+      const next = contentTypes.replace(/<Override\b[^>]*?(?:\/>|>\s*<\/Override>)/g, (o) =>
+        doomed.has((attrOf(o, "PartName") ?? "").replace(/^\//, "")) ? "" : o,
+      );
+      if (next !== contentTypes) this.zip.addFile("[Content_Types].xml", Buffer.from(next, "utf8"));
+    }
+  }
+
+  /** The package paths a rels part points at, external targets excepted. */
+  private internalTargets(relsPath: string): string[] {
+    const xml = this.zip.readAsText(relsPath);
+    if (!xml) return [];
+    // "word/_rels/comments.xml.rels" describes "word/comments.xml"; "_rels/.rels" the root.
+    const owner = relsPath.replace(/(^|\/)_rels\/([^/]*)\.rels$/, "$1$2");
+    const out: string[] = [];
+    for (const m of xml.matchAll(RELATIONSHIP_ELEMENT)) {
+      const target = attrOf(m[0], "Target");
+      if (target && attrOf(m[0], "TargetMode") !== "External") out.push(resolvePartPath(owner, target));
+    }
+    return out;
   }
 
   /**
@@ -199,20 +361,28 @@ export class MergeManager {
     source: MdocxengineType,
     blocks: BodyBlock[],
     styleMap: Record<string, string>,
+    commentIds: Set<string>,
   ): Promise<BodyBlock[]> {
     const scan = blocks.map((b) => b.xml).join("\n");
+    // First, before anything is written to this document: it can refuse the source.
+    const notesScan = NOTE_KINDS.map((kind) => this.neededNotesXml(source, kind, scan)).join("\n");
     const srcRels = await this.readSourceRels(source);
     const mediaMap = await this.buildMediaMap(source, srcRels, scan);
     const hyperlinkMap = await this.buildHyperlinkMap(srcRels, scan);
-    const footnoteMap = await this.buildFootnoteMap(source, scan);
-    const importedStyles = this.collectMissingStyles(source, scan, styleMap);
-    // One numbering pass over blocks AND imported styles, so a list used by both
-    // maps to the same copied definition.
+    // A note brings its own styles and lists: `FootnoteText` often appears nowhere
+    // but in the notes, and undefined it renders as Normal, at body size.
+    const importedStyles = this.collectMissingStyles(source, scan + "\n" + notesScan, styleMap);
+    // One numbering pass over blocks, notes AND imported styles, so a list used by
+    // more than one maps to the same copied definition.
     const numberingMap = await this.buildNumberingMap(
       source,
-      scan + "\n" + importedStyles.map((x) => x.xml).join("\n"),
+      scan + "\n" + notesScan + "\n" + importedStyles.map((x) => x.xml).join("\n"),
     );
     this.importStyles(importedStyles, numberingMap);
+    const prepareNote = (xml: string) =>
+      this.applyStyleMap(this.applyNumIdMap(stripCommentMarks(xml, commentIds), numberingMap), styleMap);
+    const footnoteMap = await this.buildNoteMap(source, "footnote", scan, prepareNote);
+    const endnoteMap = await this.buildNoteMap(source, "endnote", scan, prepareNote);
     const chartMap = await this.buildChartMap(source, srcRels, scan);
     const vmlOleMap = await this.buildVmlOleMap(source, srcRels, scan);
     const ids = this.planIds(scan);
@@ -221,7 +391,8 @@ export class MergeManager {
       let xml = b.xml;
       xml = this.applyAttrMap(xml, ["r:embed", "r:link"], mediaMap);
       xml = this.applyHyperlinkMap(xml, hyperlinkMap);
-      xml = this.applyFootnoteRefMap(xml, footnoteMap);
+      xml = this.applyNoteRefMap(xml, "footnote", footnoteMap);
+      xml = this.applyNoteRefMap(xml, "endnote", endnoteMap);
       xml = this.applyNumIdMap(xml, numberingMap);
       xml = this.applyChartMap(xml, chartMap);
       xml = this.applyVmlOleMap(xml, vmlOleMap);
@@ -704,22 +875,45 @@ export class MergeManager {
     return out;
   }
 
-  // ─── Footnotes (verbatim element copy, rich-content fidelity) ────────────────
+  // ─── Footnotes + endnotes (verbatim element copy, rich-content fidelity) ─────
 
-  /** Copy each referenced source footnote verbatim; return source-id → new-id. */
-  private async buildFootnoteMap(
+  /**
+   * The source notes `blocksXml` refers to, as XML. A reference whose note does not
+   * exist THROWS: Word refuses such a file, and left in place the id could land on
+   * a different note this document already has, which nothing downstream would see.
+   */
+  private neededNotesXml(source: MdocxengineType, kind: NoteKind, blocksXml: string): string {
+    const wanted = noteRefIds(blocksXml, kind);
+    if (wanted.size === 0) return "";
+    const partXml = source.zip.readAsText(`word/${kind}s.xml`) ?? "";
+    const found = new Map<string, string>();
+    for (const m of partXml.matchAll(new RegExp(`<w:${kind}\\b[^>]*\\bw:id="([^"]+)"[^>]*?(?:/>|>[\\s\\S]*?</w:${kind}>)`, "g"))) {
+      if (wanted.has(m[1]) && !/\bw:type=/.test(m[0].slice(0, m[0].indexOf(">")))) found.set(m[1], m[0]);
+    }
+    const missing = [...wanted].filter((id) => !found.has(id));
+    if (missing.length) {
+      throw new Error(`merge: ${kind} reference(s) ${missing.join(", ")} have no ${kind} in the source document`);
+    }
+    return [...found.values()].join("\n");
+  }
+
+  /** Copy each referenced source note verbatim; return source-id → new-id. `prepare`
+   *  runs on each note before its relationships are remapped. */
+  private async buildNoteMap(
     source: MdocxengineType,
+    kind: NoteKind,
     blocksXml: string,
+    prepare: (noteXml: string) => string,
   ): Promise<Record<string, string>> {
-    const refIds = new Set(
-      [...blocksXml.matchAll(/<w:footnoteReference\b[^>]*\bw:id="([^"]+)"/g)].map((m) => m[1]),
-    );
+    const refIds = noteRefIds(blocksXml, kind);
     if (refIds.size === 0) return {};
-    const sourceFootnotesXml = source.zip.readAsText("word/footnotes.xml");
-    // A footnote's `r:embed` resolves against word/_rels/footnotes.xml.rels, not
-    // the document rels — so its images are copied into THAT part's rels.
-    const srcRelsXml = source.zip.readAsText("word/_rels/footnotes.xml.rels");
-    const fnRels: Record<string, { type: string; target: string; external: boolean }> = {};
+    const notesPart = `word/${kind}s.xml`;
+    const relsPath = `word/_rels/${kind}s.xml.rels`;
+    const sourceNotesXml = source.zip.readAsText(notesPart);
+    // A note's `r:embed` resolves against its own part's rels, not the document
+    // rels — so what it points at is copied into THAT part's rels.
+    const srcRelsXml = source.zip.readAsText(relsPath);
+    const noteRels: Record<string, { type: string; target: string; external: boolean }> = {};
     // Parsed, not regex-scanned: Targets are XML-escaped on disk (`&amp;`), and
     // addRelationship escapes again on write — raw text would double-escape a URL.
     if (srcRelsXml) {
@@ -727,7 +921,7 @@ export class MergeManager {
       const raw = obj?.Relationships?.Relationship;
       for (const r of Array.isArray(raw) ? raw : raw ? [raw] : []) {
         if (r?.$?.Id && r?.$?.Target != null) {
-          fnRels[r.$.Id] = {
+          noteRels[r.$.Id] = {
             type: String(r.$.Type ?? ""),
             target: String(r.$.Target),
             external: r.$.TargetMode === "External",
@@ -735,27 +929,47 @@ export class MergeManager {
         }
       }
     }
-    const fnRelMgr = new RelManager(this.zip, "word/_rels/footnotes.xml.rels");
-    const rewrite = async (xml: string): Promise<string> => {
+    const relMgr = new RelManager(this.zip, relsPath);
+    const copied = new Map<string, string>();
+    const rewrite = async (raw: string): Promise<string> => {
+      const xml = prepare(raw);
       const ids = new Map<string, string>();
-      for (const m of xml.matchAll(/\br:(?:id|embed|link)="([^"]+)"/g)) {
-        const rel = fnRels[m[1]];
+      for (const m of xml.matchAll(/\b(?:r:(?:id|embed|link|pict|href)|o:relid)="([^"]+)"/g)) {
+        const rel = noteRels[m[1]];
         if (!rel || ids.has(m[1])) continue;
         if (rel.external) {
-          // Hyperlinks (and linked images) live in the footnotes part's OWN rels.
-          const newId = await fnRelMgr.genId();
-          await fnRelMgr.addRelationship(newId, rel.type, rel.target, "External");
+          // Hyperlinks (and linked images) live in the note part's OWN rels.
+          const newId = await relMgr.genId();
+          await relMgr.addRelationship(newId, rel.type, rel.target, "External");
           ids.set(m[1], newId);
           continue;
         }
-        const entry = source.zip.getEntry(resolvePartPath("word/footnotes.xml", rel.target));
+        const srcPath = resolvePartPath(notesPart, rel.target);
+        const entry = source.zip.getEntry(srcPath);
         if (!entry) continue;
-        const ext = (/\.([a-zA-Z0-9]+)$/.exec(rel.target)?.[1] ?? "png").toLowerCase();
-        ids.set(m[1], await this.media.addImageToPartRels("word/footnotes.xml", entry.getData(), ext));
+        if (/\/image$/.test(rel.type)) {
+          const ext = (/\.([a-zA-Z0-9]+)$/.exec(rel.target)?.[1] ?? "png").toLowerCase();
+          ids.set(m[1], await this.media.addImageToPartRels(notesPart, entry.getData(), ext));
+          continue;
+        }
+        // Not a picture (an OLE object, a chart): the part keeps its own
+        // relationship type and brings its closure along.
+        const newPath = await this.copyPartClosure(
+          source,
+          srcPath,
+          await this.readContentTypeOverrides(source.zip),
+          await this.readContentTypeDefaults(source.zip),
+          copied,
+        );
+        const newId = await relMgr.genId();
+        await relMgr.addRelationship(newId, rel.type, newPath.replace(/^word\//, ""));
+        ids.set(m[1], newId);
       }
-      return this.applyAttrMap(xml, ["r:embed", "r:link", "r:id"], Object.fromEntries(ids));
+      return this.applyAttrMap(xml, ["r:embed", "r:link", "r:id", "r:pict", "r:href", "o:relid"], Object.fromEntries(ids));
     };
-    return this.footnotes.copyFootnotesVerbatim(sourceFootnotesXml, refIds, rewrite);
+    return kind === "footnote"
+      ? this.footnotes.copyFootnotesVerbatim(sourceNotesXml, refIds, rewrite)
+      : this.endnotes.copyEndnotesVerbatim(sourceNotesXml, refIds, rewrite);
   }
 
   // ─── Numbering (Phase 2) ─────────────────────────────────────────────────────
@@ -853,10 +1067,10 @@ export class MergeManager {
     );
   }
 
-  /** Remap w:id ONLY inside <w:footnoteReference .../> (never other w:id). */
-  private applyFootnoteRefMap(xml: string, idMap: Record<string, string>): string {
+  /** Remap w:id ONLY inside <w:footnoteReference/> or <w:endnoteReference/> (never other w:id). */
+  private applyNoteRefMap(xml: string, kind: NoteKind, idMap: Record<string, string>): string {
     if (Object.keys(idMap).length === 0) return xml;
-    return xml.replace(/<w:footnoteReference\b[^>]*>/g, (tag) =>
+    return xml.replace(new RegExp(`<w:${kind}Reference\\b[^>]*>`, "g"), (tag) =>
       tag.replace(/\bw:id="([^"]+)"/, (full, val) => (idMap[val] ? `w:id="${idMap[val]}"` : full)),
     );
   }

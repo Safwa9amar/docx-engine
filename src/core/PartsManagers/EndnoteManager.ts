@@ -3,6 +3,7 @@ import { RelManager } from "@/core/PartsManagers/RelManager";
 import { ContentTypesManager } from "./ContentTypesManager";
 import { Run as RunInterface } from "@/core/files/paragraph/types";
 import AdmZip from "adm-zip";
+import { wordRootAttributes } from "@/utils/rootNamespaces";
 
 const ENDNOTES_PATH = "word/endnotes.xml";
 const ENDNOTE_REL_TYPE =
@@ -47,7 +48,9 @@ export class EndnoteManager {
   private emptyEndnotesDoc(): any {
     return {
       "w:endnotes": {
-        $: { "xmlns:w": ENDNOTE_NS },
+        // The standard Word set: endnotes copied from a modern source carry
+        // r:id, w14:paraId, mc:AlternateContent… all of which need a binding.
+        $: { ...wordRootAttributes(), "xmlns:w": ENDNOTE_NS },
         "w:endnote": [
           {
             $: { "w:type": "separator", "w:id": "-1" },
@@ -136,6 +139,65 @@ export class EndnoteManager {
     await this.writeEndnotes(obj);
 
     return { id, run: this.createEndnoteRun(id) };
+  }
+
+  /**
+   * Copy endnote ELEMENTS verbatim from another document's endnotes.xml string,
+   * preserving their rich content (runs, rPr, hyperlinks). Each needed endnote is
+   * appended under a fresh, collision-free id; returns source-id → new-id.
+   *
+   * Byte-faithful string injection, the same as
+   * `FootnoteManager.copyFootnotesVerbatim`: `rewrite` is where the caller fixes
+   * what a note references (relationships, numbering).
+   */
+  public async copyEndnotesVerbatim(
+    sourceEndnotesXml: string | null,
+    neededIds: Set<string>,
+    rewrite?: (endnoteXml: string) => Promise<string>,
+  ): Promise<Record<string, string>> {
+    if (!sourceEndnotesXml || neededIds.size === 0) return {};
+
+    // Extract the needed user endnote elements (skip separators) from the source.
+    const elements: { id: string; xml: string }[] = [];
+    const re = /<w:endnote\b[^>]*\bw:id="([^"]+)"[^>]*?(?:\/>|>[\s\S]*?<\/w:endnote>)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(sourceEndnotesXml)) !== null) {
+      const openTag = m[0].slice(0, m[0].indexOf(">"));
+      if (/\bw:type=/.test(openTag)) continue; // separator / continuationSeparator
+      if (!neededIds.has(m[1])) continue;
+      elements.push({ id: m[1], xml: m[0] });
+    }
+    if (elements.length === 0) return {};
+
+    await this.ensureRegistered();
+    let targetXml = this.zip.readAsText(ENDNOTES_PATH);
+    if (!targetXml) return {};
+
+    // Next id = max existing endnote id + 1 (separators -1/0 never raise it).
+    let nextId = 1;
+    const idRe = /<w:endnote\b[^>]*\bw:id="(-?\d+)"/g;
+    let im: RegExpExecArray | null;
+    while ((im = idRe.exec(targetXml)) !== null) {
+      const n = parseInt(im[1], 10);
+      if (n >= nextId) nextId = n + 1;
+    }
+
+    const idMap: Record<string, string> = {};
+    const injected: string[] = [];
+    for (const el of elements) {
+      const newId = String(nextId++);
+      const xml = rewrite ? await rewrite(el.xml) : el.xml;
+      const gt = xml.indexOf(">");
+      const open = xml.slice(0, gt).replace(/\bw:id="[^"]+"/, `w:id="${newId}"`);
+      injected.push(open + xml.slice(gt));
+      idMap[el.id] = newId;
+    }
+
+    const close = targetXml.lastIndexOf("</w:endnotes>");
+    if (close === -1) return {};
+    targetXml = targetXml.slice(0, close) + injected.join("") + targetXml.slice(close);
+    this.zip.addFile(ENDNOTES_PATH, Buffer.from(targetXml, "utf-8"));
+    return idMap;
   }
 
   /**

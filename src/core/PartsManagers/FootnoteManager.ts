@@ -173,7 +173,7 @@ export class FootnoteManager {
 
     // Extract the needed user footnote elements (skip separators) from the source.
     const elements: { id: string; xml: string }[] = [];
-    const re = /<w:footnote\b[^>]*\bw:id="([^"]+)"[^>]*>[\s\S]*?<\/w:footnote>/g;
+    const re = /<w:footnote\b[^>]*\bw:id="([^"]+)"[^>]*?(?:\/>|>[\s\S]*?<\/w:footnote>)/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(sourceFootnotesXml)) !== null) {
       const openTag = m[0].slice(0, m[0].indexOf(">"));
