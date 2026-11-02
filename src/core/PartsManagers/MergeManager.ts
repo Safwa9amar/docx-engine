@@ -553,11 +553,20 @@ export class MergeManager {
     // the document rels — so its images are copied into THAT part's rels.
     const srcRelsXml = source.zip.readAsText("word/_rels/footnotes.xml.rels");
     const fnRels: Record<string, { type: string; target: string; external: boolean }> = {};
-    for (const m of srcRelsXml.matchAll(/<Relationship\b[^>]*>/g)) {
-      const id = /\bId="([^"]+)"/.exec(m[0])?.[1];
-      const target = /\bTarget="([^"]+)"/.exec(m[0])?.[1];
-      const type = /\bType="([^"]+)"/.exec(m[0])?.[1] ?? "";
-      if (id && target) fnRels[id] = { type, target, external: /TargetMode="External"/.test(m[0]) };
+    // Parsed, not regex-scanned: Targets are XML-escaped on disk (`&amp;`), and
+    // addRelationship escapes again on write — raw text would double-escape a URL.
+    if (srcRelsXml) {
+      const obj: any = await parseXml(srcRelsXml);
+      const raw = obj?.Relationships?.Relationship;
+      for (const r of Array.isArray(raw) ? raw : raw ? [raw] : []) {
+        if (r?.$?.Id && r?.$?.Target != null) {
+          fnRels[r.$.Id] = {
+            type: String(r.$.Type ?? ""),
+            target: String(r.$.Target),
+            external: r.$.TargetMode === "External",
+          };
+        }
+      }
     }
     const fnRelMgr = new RelManager(this.zip, "word/_rels/footnotes.xml.rels");
     const rewrite = async (xml: string): Promise<string> => {

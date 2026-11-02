@@ -265,4 +265,87 @@ describe("MergeManager — VML pictures and OLE objects survive a merge", () => 
     // the footnote image still resolves too
     expect(out).toMatch(/r:embed="rId\d+"/);
   });
+
+  describe("footnote relationship ids never collide with the target's", () => {
+    const HL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
+    const hlRel = (id: string, url: string) =>
+      `<Relationship Id="${id}" Type="${HL}" Target="${url}" TargetMode="External"/>`;
+
+    /** A docx with ONE footnote whose hyperlinks are `links` (rId -> url), rels in footnotes.xml.rels. */
+    async function fnDoc(links: Record<string, string>, buf?: Mdocxengine): Promise<Mdocxengine> {
+      const e = buf ?? (await Mdocxengine.loadFromFile("samples/example.docx"));
+      const id = (await e.footnotes.addFootnote("n")).id;
+      const fx = e.zip.readAsText("word/footnotes.xml")!;
+      const xml = Object.keys(links)
+        .map((r) => `<w:hyperlink r:id="${r}"><w:r><w:t>${links[r]}</w:t></w:r></w:hyperlink>`)
+        .join("");
+      const patched = fx.replace(
+        new RegExp(`(<w:footnote\\b[^>]*w:id="${id}"[^>]*>[\\s\\S]*?)(</w:p>\\s*</w:footnote>)`),
+        `$1${xml}$2`,
+      );
+      if (xml) expect(patched).not.toBe(fx);
+      e.zip.addFile("word/footnotes.xml", Buffer.from(patched, "utf8"));
+      const prev = e.zip.readAsText("word/_rels/footnotes.xml.rels");
+      const relXml = Object.entries(links).map(([r, u]) => hlRel(r, u)).join("");
+      const rels = prev
+        ? prev.includes("</Relationships>")
+          ? prev.replace("</Relationships>", `${relXml}</Relationships>`)
+          : prev.replace(/\/>\s*$/, `>${relXml}</Relationships>`)
+        : `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${relXml}</Relationships>`;
+      e.zip.addFile("word/_rels/footnotes.xml.rels", Buffer.from(rels, "utf8"));
+      await e.document.saveBlocks([
+        makeParagraphNode("body"),
+        { kind: "paragraph", tag: "w:p", xml: `<w:p><w:r><w:footnoteReference w:id="${id}"/></w:r></w:p>` },
+      ]);
+      return e;
+    }
+
+    /** Every footnote hyperlink's text (its URL) vs. what its r:id resolves to. */
+    function resolveAll(e: Mdocxengine): { text: string; url: string | undefined }[] {
+      const fx = e.zip.readAsText("word/footnotes.xml")!;
+      const rels = e.zip.readAsText("word/_rels/footnotes.xml.rels")!;
+      const url = new Map<string, string>();
+      for (const m of rels.matchAll(/<Relationship\b[^>]*>/g)) {
+        url.set(/\bId="([^"]+)"/.exec(m[0])![1], /\bTarget="([^"]+)"/.exec(m[0])![1]);
+      }
+      return [...fx.matchAll(/<w:hyperlink\b[^>]*\br:id="([^"]+)"[^>]*><w:r><w:t>([^<]+)</g)].map((m) => ({
+        text: m[2],
+        url: url.get(m[1]),
+      }));
+    }
+
+    test("a target that already owns rId1 keeps it; the source's links get fresh ids", async () => {
+      const t = await fnDoc({ rId1: "https://a.example/A" });
+      const src = await fnDoc({ rId1: "https://b.example/B", rId2: "https://c.example/C" });
+      await t.merge.appendDocument(src.zip.toBuffer(), {});
+      const all = resolveAll(t);
+      expect(all.map((x) => x.text).sort()).toEqual([
+        "https://a.example/A",
+        "https://b.example/B",
+        "https://c.example/C",
+      ]);
+      for (const x of all) expect(x.url).toBe(x.text);
+    });
+
+    test("a sequence of appends, each reusing rId1/rId2, never crosses wires", async () => {
+      const t = await fnDoc({ rId1: "https://a.example/A" });
+      await t.merge.appendDocument((await fnDoc({ rId1: "https://b.example/B" })).zip.toBuffer(), {});
+      await t.merge.appendDocument((await fnDoc({ rId1: "https://c.example/C", rId2: "https://d.example/D" })).zip.toBuffer(), {});
+      await t.merge.appendDocument((await fnDoc({ rId2: "https://e.example/E", rId1: "https://f.example/F" })).zip.toBuffer(), {});
+      const all = resolveAll(t);
+      expect(all).toHaveLength(6);
+      for (const x of all) expect(x.url).toBe(x.text);
+      const ids = [...t.zip.readAsText("word/footnotes.xml")!.matchAll(/<w:hyperlink\b[^>]*\br:id="([^"]+)"/g)].map((m) => m[1]);
+      expect(new Set(ids).size).toBe(6);
+    });
+
+    test("an XML-escaped URL (&amp;) is carried as the same URL, not double-escaped", async () => {
+      const t = await fnDoc({});
+      const src = await fnDoc({ rId1: "https://b.example/?a=1&amp;b=2", rId2: "https://c.example/C" });
+      await t.merge.appendDocument(src.zip.toBuffer(), {});
+      const rels = t.zip.readAsText("word/_rels/footnotes.xml.rels")!;
+      expect(rels).toContain("https://b.example/?a=1&amp;b=2");
+      expect(rels).not.toContain("&amp;amp;");
+    });
+  });
 });
