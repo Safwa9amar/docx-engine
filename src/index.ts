@@ -480,6 +480,8 @@ export {
   type ParaStyleProps,
 } from "./core/PartsManagers/StylesManager";
 
+export { declareUsedPrefixes, undeclaredPrefixes, isKnownPrefix, type UndeclaredPrefix } from "./core/ooxml/namespaces";
+
 // ── Document doctor ──────────────────────────────────────────────────────────
 // Package-level validation and repair for the corruption classes that make Word
 // refuse a .docx. Lives here rather than in a consumer because it is pure OOXML

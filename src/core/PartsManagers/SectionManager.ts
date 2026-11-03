@@ -1,6 +1,7 @@
 import * as XmlUtils from "@/utils/xmlUtils";
 import AdmZip from "adm-zip";
 import { splitDocument, assembleDocument } from "@/core/files/body/OrderedBody";
+import { declareUsedPrefixes } from "@/core/ooxml/namespaces";
 import {
   upsertSectPrReference,
   upsertSectPrPageNumbering,
@@ -305,6 +306,7 @@ export class SectionManager {
     type: "default" | "first" | "even" = "default",
   ): Promise<void> {
     await this.editSectionSectPr(sectionIndex, (s) => upsertSectPrReference(s, "header", type, relId));
+    this.declareRelationshipPrefix();
   }
 
   public async setSectionFooter(
@@ -313,6 +315,7 @@ export class SectionManager {
     type: "default" | "first" | "even" = "default",
   ): Promise<void> {
     await this.editSectionSectPr(sectionIndex, (s) => upsertSectPrReference(s, "footer", type, relId));
+    this.declareRelationshipPrefix();
   }
 
   /**
@@ -369,6 +372,14 @@ export class SectionManager {
    * are counted in document order: paragraph-level sectPrs first, final last —
    * the same order as getSections().
    */
+  /** A reference is written as `r:id`; a root that declares only `xmlns:w` would then be refused by Word. */
+  private declareRelationshipPrefix(): void {
+    const xml = this.zip.readAsText(DOCUMENT_PATH);
+    if (!xml) return;
+    const next = declareUsedPrefixes(xml);
+    if (next !== xml) this.zip.addFile(DOCUMENT_PATH, Buffer.from(next, "utf-8"));
+  }
+
   private async editSectionSectPr(sectionIndex: number, transform: (sectPrXml: string) => string): Promise<void> {
     const xml = this.zip.readAsText(DOCUMENT_PATH);
     if (!xml) throw new Error("word/document.xml not found");

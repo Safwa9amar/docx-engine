@@ -61,6 +61,7 @@ import { ZipManager } from "@/utils/ZipManager";
 import { parseOrderedDoc, buildOrderedDoc } from "@/core/files/body/OrderedBody";
 import type { BodyBlock } from "@/core/files/body/OrderedBody";
 import { updateParagraphProps } from "@/core/ooxml/paragraphProps";
+import { declareUsedPrefixes, undeclaredPrefixes } from "@/core/ooxml/namespaces";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -421,6 +422,45 @@ function checkWellFormed(zip: DocxZip, names: string[]): Finding[] {
     }
   }
   return out;
+}
+
+/**
+ * Every prefix a part uses must be declared. A tag matcher calls such a part well-formed, and Word
+ * refuses the whole file: a root declaring only `xmlns:w` plus a section reference written as `r:id`
+ * is enough. Word's own prefixes are repaired by declaring them on the root.
+ */
+function checkPrefixes(zip: DocxZip, names: string[], fix: boolean): { findings: Finding[]; rewrote: string[] } {
+  const findings: Finding[] = [];
+  const rewrote: string[] = [];
+  for (const name of names) {
+    if (!/^word\/[^/]+\.xml$/.test(name)) continue;
+    const xml = readPart(zip, name);
+    if (xml == null || firstXmlError(xml)) continue; // already reported as malformed
+    const missing = undeclaredPrefixes(xml);
+    if (!missing.length) continue;
+    let left = missing;
+    if (fix) {
+      const next = declareUsedPrefixes(xml);
+      if (next !== xml) {
+        zip.addFile(name, Buffer.from(next, "utf8"));
+        rewrote.push(name);
+        left = undeclaredPrefixes(next);
+      }
+    }
+    const fixed = fix && left.length === 0;
+    const shown = fixed ? missing : left;
+    findings.push(finding({
+      rule: "xml.undeclared-prefix",
+      severity: "fatal",
+      part: name,
+      count: shown.reduce((n, u) => n + u.count, 0),
+      message: `${name} uses namespace prefixes it never declares. Word will refuse the document.`,
+      fixable: left.length === 0 || missing.length !== left.length,
+      fixed,
+      detail: sample(shown.map((u) => u.prefix)),
+    }));
+  }
+  return { findings, rewrote };
 }
 
 /** Every part that needs a content-type Override must have one. */
@@ -1654,6 +1694,10 @@ export function inspectDocx(zip: DocxZip, opts: InspectOptions = {}): DoctorRepo
 
   findings.push(...checkRequiredParts(present));
   findings.push(...checkWellFormed(zip, names));
+
+  const prefixes = checkPrefixes(zip, names, fix);
+  findings.push(...prefixes.findings);
+  prefixes.rewrote.forEach((p) => rewrote.add(p));
 
   const ct = checkContentTypes(zip, names, fix);
   findings.push(...ct.findings);

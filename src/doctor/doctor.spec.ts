@@ -1266,3 +1266,45 @@ describe("docx-doctor: a reference resolving to the wrong KIND of part", () => {
     expect(rulesOf(zip)).not.toContain("rels.type-mismatch");
   });
 });
+
+describe("docx-doctor: a namespace prefix nothing declares", () => {
+  const ONLY_W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+  const bare = (body: string) => {
+    const zip = pkg(body);
+    const xml = zip.readAsText("word/document.xml").replace(NS, ONLY_W);
+    zip.updateFile("word/document.xml", Buffer.from(xml, "utf8"));
+    return zip;
+  };
+  const withHeader = `<w:p/><w:sectPr><w:headerReference w:type="default" r:id="rId9"/><w:pgSz w:w="11906" w:h="16838"/></w:sectPr>`;
+
+  it("is fatal: Word refuses the file though it is well-formed", () => {
+    const zip = bare(withHeader);
+    expect(findRule(zip, "xml.undeclared-prefix")).toMatchObject({ severity: "fatal", part: "word/document.xml", detail: "r" });
+  });
+
+  it("a known prefix is repaired by declaring it on the root, and nothing else moves", () => {
+    const zip = bare(`<w:p><w:r><w:t>text</w:t></w:r></w:p>` + withHeader);
+    const before = zip.readAsText("word/document.xml");
+    inspectDocx(zip, { fix: true });
+    const after = zip.readAsText("word/document.xml");
+    expect(after).toContain('xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"');
+    expect(after.slice(after.indexOf("<w:body>"))).toBe(before.slice(before.indexOf("<w:body>")));
+    expect(rulesOf(zip)).not.toContain("xml.undeclared-prefix");
+  });
+
+  it("an unknown prefix cannot be repaired and stays fatal", () => {
+    const zip = bare(`<w:p><foo:x/></w:p>${SECT}`);
+    expect(findRule(zip, "xml.undeclared-prefix", { fix: true })).toMatchObject({ severity: "fatal", fixed: false, detail: "foo" });
+  });
+
+  it("reaches headers and notes, not only the document", () => {
+    const zip = pkg(P() + SECT, { "word/header1.xml": `<?xml version="1.0"?><w:hdr ${ONLY_W}><w:p><w:r><w:drawing><a:x/></w:drawing></w:r></w:p></w:hdr>` },
+      '<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>');
+    expect(findRule(zip, "xml.undeclared-prefix")).toMatchObject({ part: "word/header1.xml", detail: "a" });
+  });
+
+  it("a healthy package is untouched", () => {
+    const zip = pkg(P() + SECT);
+    expect(rulesOf(zip)).not.toContain("xml.undeclared-prefix");
+  });
+});
