@@ -465,8 +465,44 @@ function checkPrefixes(zip: DocxZip, names: string[], fix: boolean): { findings:
 
 /** Every part that needs a content-type Override must have one. */
 function checkContentTypes(zip: DocxZip, names: string[], fix: boolean): { findings: Finding[]; rewrote: boolean } {
-  const xml = readPart(zip, CONTENT_TYPES);
+  let xml = readPart(zip, CONTENT_TYPES);
   if (xml == null) return { findings: [], rewrote: false };
+
+  // A second Default for an extension (their case does not count) or a second Override for a part: Word
+  // refuses the file, and a fonts or media writer comparing case-sensitively writes exactly that.
+  const seen = new Set<string>();
+  const repeats: { tag: string; shown: string }[] = [];
+  for (const m of xml.matchAll(/<(Default|Override)\b[^>]*?\b(Extension|PartName)="([^"]+)"[^>]*?(?:\/>|>\s*<\/\1>)/g)) {
+    const key = `${m[1]}:${m[3].toLowerCase()}`;
+    if (seen.has(key)) repeats.push({ tag: m[0], shown: m[3] });
+    seen.add(key);
+  }
+  const duplicates: Finding[] = [];
+  let dedup = false;
+  if (repeats.length) {
+    if (fix) {
+      // Later ones go, so the file's first statement of each stands.
+      const kept = new Set<string>();
+      xml = xml.replace(/<(Default|Override)\b[^>]*?\b(Extension|PartName)="([^"]+)"[^>]*?(?:\/>|>\s*<\/\1>)/g, (tag, kind, _a, value) => {
+        const key = `${kind}:${value.toLowerCase()}`;
+        if (kept.has(key)) return "";
+        kept.add(key);
+        return tag;
+      });
+      zip.addFile(CONTENT_TYPES, Buffer.from(xml, "utf8"));
+      dedup = true;
+    }
+    duplicates.push(finding({
+      rule: "contenttypes.duplicate",
+      severity: "fatal",
+      part: CONTENT_TYPES,
+      count: repeats.length,
+      message: `[Content_Types].xml states ${repeats.length} entr${repeats.length === 1 ? "y" : "ies"} twice. Word refuses the document.`,
+      detail: sample(repeats.map((r) => r.shown)),
+      fixable: true,
+      fixed: dedup,
+    }));
+  }
 
   const declared = new Set<string>();
   for (const m of xml.matchAll(/<Override\b[^>]*PartName="\/?([^"]+)"/g)) declared.add(m[1]);
@@ -476,9 +512,9 @@ function checkContentTypes(zip: DocxZip, names: string[], fix: boolean): { findi
     const type = contentTypeFor(name);
     if (type && !declared.has(name)) missing.push({ part: name, type });
   }
-  if (!missing.length) return { findings: [], rewrote: false };
+  if (!missing.length) return { findings: duplicates, rewrote: dedup };
 
-  let rewrote = false;
+  let rewrote = dedup;
   if (fix) {
     const closeAt = xml.lastIndexOf("</Types>");
     if (closeAt !== -1) {
@@ -489,7 +525,7 @@ function checkContentTypes(zip: DocxZip, names: string[], fix: boolean): { findi
   }
 
   return {
-    findings: [finding({
+    findings: [...duplicates, finding({
       rule: "contenttypes.missing-override",
       severity: "fatal",
       part: CONTENT_TYPES,

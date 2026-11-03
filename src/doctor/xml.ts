@@ -203,6 +203,20 @@ export function rewriteElements(
   return { xml: out, changed };
 }
 
+const ATTRIBUTE = /\s([^\s=<>/]+)\s*=\s*(?:"[^"]*"|'[^']*')/g;
+
+/** The name of an attribute an open tag states twice; null when none does. Values are skipped whole. */
+function repeatedAttribute(tag: string): string | null {
+  const first = tag.indexOf("=");
+  if (first < 0 || tag.indexOf("=", first + 1) < 0) return null;
+  const seen = new Set<string>();
+  for (const m of tag.matchAll(ATTRIBUTE)) {
+    if (seen.has(m[1])) return m[1];
+    seen.add(m[1]);
+  }
+  return null;
+}
+
 /** A cheap well-formedness check: tag balance with quote/comment awareness.
  *  Not a validator — its job is to catch a part we (or a previous writer) tore. */
 export function firstXmlError(xml: string): string | null {
@@ -219,8 +233,11 @@ export function firstXmlError(xml: string): string | null {
       if (xml[lt + 1] === "/") {
         const open = stack.pop();
         if (open !== tag) return `</${tag}> closes <${open ?? "nothing"}>`;
-      } else if (xml[end - 2] !== "/") {
-        stack.push(tag);
+      } else {
+        // XML forbids it, and Word refuses the whole file for it: a tag matcher alone would pass this.
+        const repeated = repeatedAttribute(xml.slice(lt, end));
+        if (repeated) return `<${tag}> repeats attribute ${repeated}`;
+        if (xml[end - 2] !== "/") stack.push(tag);
       }
     }
     i = end;

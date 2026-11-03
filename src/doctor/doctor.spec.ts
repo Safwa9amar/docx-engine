@@ -1308,3 +1308,36 @@ describe("docx-doctor: a namespace prefix nothing declares", () => {
     expect(rulesOf(zip)).not.toContain("xml.undeclared-prefix");
   });
 });
+
+describe("docx-doctor: what a tag matcher passes and Word refuses", () => {
+  it("a repeated attribute on one element is malformed", () => {
+    expect(firstXmlError('<a x="1" x="2"/>')).toMatch(/repeats/);
+    expect(firstXmlError('<a x="1" y="2" X="3"/>')).toBeNull();
+    const zip = pkg(`<w:p w:rsidR="00A1" w:rsidR="00A2"><w:r><w:t>x</w:t></w:r></w:p>${SECT}`);
+    expect(findRule(zip, "xml.malformed")).toMatchObject({ severity: "fatal", part: "word/document.xml" });
+  });
+
+  it("a value that spells an attribute is a value", () => {
+    expect(firstXmlError(`<a x="y='1' y='2'"/>`)).toBeNull();
+    expect(firstXmlError("<a>x='1' x='2'</a>")).toBeNull();
+  });
+
+  it("a second Default for one extension, in another case, is fatal and repaired to the first", () => {
+    const zip = pkg(P() + SECT);
+    const ct = zip.readAsText("[Content_Types].xml").replace("</Types>", '<Default Extension="odttf" ContentType="application/vnd.openxmlformats-officedocument.obfuscatedFont"/><Default Extension="ODTTF" ContentType="application/vnd.openxmlformats-officedocument.obfuscatedFont"/></Types>');
+    zip.updateFile("[Content_Types].xml", Buffer.from(ct, "utf8"));
+    expect(findRule(zip, "contenttypes.duplicate")).toMatchObject({ severity: "fatal", detail: "odttf" });
+    inspectDocx(zip, { fix: true });
+    const after = zip.readAsText("[Content_Types].xml");
+    expect(after).toContain('Extension="odttf"');
+    expect(after).not.toContain('Extension="ODTTF"');
+    expect(rulesOf(zip)).not.toContain("contenttypes.duplicate");
+  });
+
+  it("a second Override for one part is the same fault", () => {
+    const zip = pkg(P() + SECT);
+    const ct = zip.readAsText("[Content_Types].xml").replace("</Types>", '<Override PartName="/word/document.xml" ContentType="application/xml"/></Types>');
+    zip.updateFile("[Content_Types].xml", Buffer.from(ct, "utf8"));
+    expect(findRule(zip, "contenttypes.duplicate")).toMatchObject({ severity: "fatal", detail: "/word/document.xml" });
+  });
+});

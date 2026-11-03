@@ -96,7 +96,8 @@ export class ContentTypesManager {
   async addDefault(extension: string, contentType: string): Promise<void> {
     const typesObj = await this.readTypes();
 
-    const exists = typesObj.Types.Default.some((d) => d.$.Extension === extension);
+    // OPC compares extensions without case, and Word refuses a second Default for one.
+    const exists = typesObj.Types.Default.some((d) => d.$.Extension.toLowerCase() === extension.toLowerCase());
     if (!exists) {
       typesObj.Types.Default.push({
         $: { Extension: extension, ContentType: contentType },
