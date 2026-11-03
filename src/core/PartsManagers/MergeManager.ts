@@ -42,6 +42,7 @@ import { parseXml } from "@/utils/xmlUtils";
 import { carryRootNamespaces } from "@/utils/rootNamespaces";
 import { assembleDocument, splitDocument, type BodyBlock } from "@/core/files/body/OrderedBody";
 import { clearFalseDataDescriptors } from "@/doctor";
+import { canonicalMainPart, canonicalizeMainPart } from "@/core/package/canonicalMainPart";
 // Imported lazily inside appendDocument() to avoid an index.ts ↔ MergeManager cycle.
 import type { Mdocxengine as MdocxengineType } from "@/index";
 
@@ -380,9 +381,12 @@ export class MergeManager {
    */
   async appendDocument(sourceBuffer: Buffer, opts: AppendOptions = {}): Promise<AppendResult> {
     const { Mdocxengine } = await import("@/index");
+    // Both packages in the shape every reader below expects: a part whose main document is
+    // elsewhere would otherwise come across as nothing at all. One with none stops here.
+    canonicalizeMainPart(this.zip);
     // A false zip flag is a two-byte fault that makes every read of that entry throw.
     const source = (await (Mdocxengine as typeof MdocxengineType).loadFromBuffer(
-      clearFalseDataDescriptors(sourceBuffer),
+      canonicalMainPart(clearFalseDataDescriptors(sourceBuffer)),
     )) as MdocxengineType;
 
     const commentIds = new Set<string>();
@@ -410,6 +414,7 @@ export class MergeManager {
    * its exact bytes; a document with no comments is not rewritten at all.
    */
   async stripComments(): Promise<number> {
+    canonicalizeMainPart(this.zip);
     const ids = new Set<string>();
     definedCommentIds(this.zip.readAsText("word/comments.xml"), ids);
 

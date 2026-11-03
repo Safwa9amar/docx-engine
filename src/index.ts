@@ -486,6 +486,7 @@ export { declareUsedPrefixes, undeclaredPrefixes, isKnownPrefix, type Undeclared
 // Package-level validation and repair for the corruption classes that make Word
 // refuse a .docx. Lives here rather than in a consumer because it is pure OOXML
 // knowledge — no thesis, database or storage concepts. See src/doctor/.
+export { canonicalMainPart, canonicalizeMainPart, mainPartOf } from "./core/package/canonicalMainPart";
 export {
   inspectDocx,
   checkDocxBuffer,
