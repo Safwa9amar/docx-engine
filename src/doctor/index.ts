@@ -498,7 +498,7 @@ function checkContentTypes(zip: DocxZip, names: string[], fix: boolean): { findi
       part: CONTENT_TYPES,
       count: repeats.length,
       message: `[Content_Types].xml states ${repeats.length} entr${repeats.length === 1 ? "y" : "ies"} twice. Word refuses the document.`,
-      detail: sample(repeats.map((r) => r.shown)),
+      detail: sample(repeats.map((r) => r.shown.toLowerCase())),
       fixable: true,
       fixed: dedup,
     }));
