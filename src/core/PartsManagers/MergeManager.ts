@@ -227,6 +227,14 @@ const ANY_OPEN_TAG = /<([\w.-]+:[\w.-]+)\b[^>]*>/g;
 /** `r:embed` and `r:link` are the media path's, whatever element holds them. */
 const OTHER_REL_ATTR = /\s(r:(?!embed\b|link\b)[a-zA-Z]+|o:relid)="([^"]+)"/g;
 
+/**
+ * What ties a content control to a store: the package's core properties, its custom XML. Word
+ * replaces the control's text from that store when it opens the file, and a later part's store stays
+ * behind, so its control would print part 1's title, or nothing. Without the binding it keeps the
+ * words it holds. An attribute may hold a `>`: an XPath can.
+ */
+const DATA_BINDING = /<(w|w15):dataBinding\b(?:"[^"]*"|'[^']*'|[^>"'])*?(?:\/>|>\s*<\/\1:dataBinding>)/g;
+
 const safeDecode = (s: string) => {
   try {
     return decodeURIComponent(s);
@@ -328,6 +336,8 @@ export interface AppendResult {
   commentsStripped: number;
   /** Where the source's note properties gave way to this document's. */
   noteConflicts: NoteConflict[];
+  /** Content controls of the source that lost their tie to a store left behind, keeping their words. */
+  bindingsDropped: number;
 }
 
 /**
@@ -393,7 +403,13 @@ export class MergeManager {
     definedCommentIds(source.zip.readAsText("word/comments.xml"), commentIds);
     const srcBlocks = stripCommentMarksFromBlocks(await source.document.getBlocks(), commentIds);
     const noteConflicts: NoteConflict[] = [];
-    const remapped = await this.remapBlocks(source, srcBlocks, opts.styleMap ?? {}, commentIds, noteConflicts);
+    let bindingsDropped = 0;
+    const unbind = (xml: string) =>
+      xml.replace(DATA_BINDING, () => {
+        bindingsDropped++;
+        return "";
+      });
+    const remapped = await this.remapBlocks(source, srcBlocks, opts.styleMap ?? {}, commentIds, noteConflicts, unbind);
 
     const existing = await this.document.getBlocks();
     const prefix: BodyBlock[] = [];
@@ -402,7 +418,7 @@ export class MergeManager {
 
     await this.document.saveBlocks([...existing, ...prefix, ...remapped]);
     this.carryNamespaces(source);
-    return { commentsStripped: commentIds.size, noteConflicts };
+    return { commentsStripped: commentIds.size, noteConflicts, bindingsDropped };
   }
 
   // ─── Comments ───────────────────────────────────────────────────────────────
@@ -526,6 +542,7 @@ export class MergeManager {
     styleMap: Record<string, string>,
     commentIds: Set<string>,
     noteConflicts: NoteConflict[],
+    unbind: (xml: string) => string,
   ): Promise<BodyBlock[]> {
     const scan = blocks.map((b) => b.xml).join("\n");
     // First, before anything is written to this document: it can refuse the source.
@@ -554,7 +571,7 @@ export class MergeManager {
     const ids = this.planIds(content);
     const prepareNote = (xml: string) =>
       this.applyIdPlan(
-        retargetStyleRefs(this.applyNumIdMap(stampNumbering(stripCommentMarks(xml, commentIds), styles), numberingMap), styles),
+        retargetStyleRefs(this.applyNumIdMap(stampNumbering(stripCommentMarks(unbind(xml), commentIds), styles), numberingMap), styles),
         ids,
       );
     for (const kind of NOTE_KINDS) {
@@ -566,7 +583,7 @@ export class MergeManager {
     const vmlOleMap = await this.buildVmlOleMap(source, srcRels, scan);
 
     return blocks.map((b) => {
-      let xml = stampNumbering(b.xml, styles);
+      let xml = stampNumbering(unbind(b.xml), styles);
       xml = this.applyAttrMap(xml, ["r:embed", "r:link"], mediaMap);
       xml = this.applyOtherRelMap(xml, otherRelMap);
       xml = this.applyHyperlinkMap(xml, hyperlinkMap);
