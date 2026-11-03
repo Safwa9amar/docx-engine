@@ -28,6 +28,7 @@
  * xml2js-based path used elsewhere).
  */
 
+import { ownPPr } from "@/core/ooxml/ownPPr";
 import * as XmlUtils from "@/utils/xmlUtils";
 import { Table } from "@/core/files/table/index";
 import { toHalfPoints } from "@/core/ooxml/hps";
@@ -777,15 +778,8 @@ function firstRunProps(xml: string): string {
  * spacing, bidi, numbering — or "" when it has none.
  */
 export function paragraphPropsXml(paragraphXml: string): string {
-  const openEnd = paragraphXml.indexOf(">") + 1;
-  const closeStart = paragraphXml.lastIndexOf("</w:p>");
-  const inner = paragraphXml.slice(openEnd, closeStart === -1 ? paragraphXml.length : closeStart);
-  if (!/^\s*<w:pPr\b/.test(inner)) return "";
-  const start = inner.indexOf("<w:pPr");
-  const openEnd2 = endOfTag(inner, start);
-  if (isSelfClosing(inner, start, openEnd2)) return inner.slice(start, openEnd2);
-  const close = inner.indexOf("</w:pPr>", openEnd2);
-  return close === -1 ? "" : inner.slice(start, close + "</w:pPr>".length);
+  const own = ownPPr(paragraphXml);
+  return own ? paragraphXml.slice(own.start, own.end) : "";
 }
 
 /**

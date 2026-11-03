@@ -12,6 +12,7 @@
  */
 import { splitDocument, assembleDocument } from "./OrderedBody";
 import { insertAfterParagraphOpen } from "@/core/ooxml/paragraphProps";
+import { ownPPr } from "@/core/ooxml/ownPPr";
 
 export type SectPrRefKind = "header" | "footer";
 
@@ -326,19 +327,16 @@ export function upsertSectPrPageBorders(sectPrXml: string, opts: SectPrPageBorde
  *  refuses the document and the app draws an unknown-block chip where the page
  *  break should be. `insertAfterParagraphOpen` normalises `<w:p/>` first. */
 export function upsertParagraphSectPr(paraXml: string, sectPrXml: string): string {
-  const pPrIdx = paraXml.indexOf("<w:pPr");
-  if (pPrIdx === -1) {
-    return insertAfterParagraphOpen(paraXml, `<w:pPr>${sectPrXml}</w:pPr>`);
-  }
-  const pPrOpenEnd = paraXml.indexOf(">", pPrIdx) + 1;
-  if (paraXml[pPrOpenEnd - 2] === "/") {
-    // self-closing <w:pPr/>
-    return paraXml.slice(0, pPrIdx) + `<w:pPr>${sectPrXml}</w:pPr>` + paraXml.slice(pPrOpenEnd);
-  }
-  const close = paraXml.indexOf("</w:pPr>", pPrOpenEnd);
-  if (close === -1) return paraXml;
-  const inner = paraXml.slice(pPrOpenEnd, close).replace(/<w:sectPr\b[\s\S]*?<\/w:sectPr>|<w:sectPr\b[^>]*\/>/g, "");
-  return paraXml.slice(0, pPrOpenEnd) + inner + sectPrXml + paraXml.slice(close);
+  const own = ownPPr(paraXml);
+  if (!own) return insertAfterParagraphOpen(paraXml, `<w:pPr>${sectPrXml}</w:pPr>`);
+  if (own.selfClosing) return paraXml.slice(0, own.start) + `<w:pPr>${sectPrXml}</w:pPr>` + paraXml.slice(own.end);
+  // CT_PPr ends rPr, sectPr, pPrChange: the record of the old properties stays last and as it was.
+  const inner = paraXml.slice(own.innerStart, own.innerEnd);
+  const change = inner.indexOf("<w:pPrChange");
+  const current = change < 0 ? inner : inner.slice(0, change);
+  const record = change < 0 ? "" : inner.slice(change);
+  const kept = current.replace(/<w:sectPr\b[\s\S]*?<\/w:sectPr>|<w:sectPr\b[^>]*\/>/g, "");
+  return paraXml.slice(0, own.innerStart) + kept + sectPrXml + record + paraXml.slice(own.innerEnd);
 }
 
 /** Remove the `<w:sectPr>` from a paragraph (the only place a paragraph carries one). */

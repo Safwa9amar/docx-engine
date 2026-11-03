@@ -212,3 +212,22 @@ describe("insertAfterParagraphOpen", () => {
     expect(insertAfterParagraphOpen("<w:p/>", "")).toBe("<w:p/>");
   });
 });
+
+// w:pPrChange holds the OLD properties in a w:pPr of its own: "the first </w:pPr>" is that one.
+describe("a paragraph with a tracked property change", () => {
+  const CHANGE = '<w:pPrChange w:id="1" w:author="A" w:date="2026-01-01T00:00:00Z"><w:pPr><w:jc w:val="left"/></w:pPr></w:pPrChange>';
+  const P = `<w:p><w:pPr><w:jc w:val="center"/>${CHANGE}</w:pPr><w:r><w:t>x</w:t></w:r></w:p>`;
+
+  test("readParagraphProps returns the whole own pPr", () => {
+    expect(readParagraphProps(P)).toBe(`<w:jc w:val="center"/>${CHANGE}`);
+  });
+
+  test("updateParagraphProps writes into the own pPr and keeps the record last", () => {
+    const out = updateParagraphProps(P, (inner) => inner + "<w:keepNext/>");
+    expect(out).toBe(`<w:p><w:pPr><w:keepNext/><w:jc w:val="center"/>${CHANGE}</w:pPr><w:r><w:t>x</w:t></w:r></w:p>`);
+  });
+
+  test("an unchanged update returns the same bytes", () => {
+    expect(updateParagraphProps(P, (inner) => inner)).toBe(P);
+  });
+});

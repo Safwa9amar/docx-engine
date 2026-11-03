@@ -117,7 +117,19 @@ const BREAK_RE = /<w:br\b(?=[^>]*\bw:type="page")[^>]*?(?:\/>|>\s*<\/w:br>)|<w:l
 const EMPTY_RUN_RE = /^<w:r(?:\s[^>]*?)?(?<!\/)>\s*(?:<w:rPr\s*\/>|<w:rPr(?:\s[^>]*)?>[\s\S]*?<\/w:rPr>)?\s*<\/w:r>$/;
 
 const RUN_RE = /<w:r(?:\s[^>]*?)?(?<!\/)>[\s\S]*?<\/w:r>/g;
-const RUN_RPR_RE = /^(<w:r(?:\s[^>]*?)?(?<!\/)>)(\s*)(<w:rPr\s*\/>|<w:rPr(?:\s[^>]*)?>([\s\S]*?)<\/w:rPr>)/;
+const RUN_OPEN_RE = /^(<w:r(?:\s[^>]*?)?(?<!\/)>)(\s*)(?=<w:rPr[\s/>])/;
+
+/** A run's own rPr, closed by depth: a tracked w:rPrChange nests the old w:rPr inside it. */
+function runProps(run: string): { open: string; gap: string; rPr: string; inner: string; end: number } | null {
+  const m = RUN_OPEN_RE.exec(run);
+  if (!m) return null;
+  const start = m[0].length;
+  const end = findElementEnd(run, start, "w:rPr");
+  if (end === -1) return null;
+  const rPr = run.slice(start, end);
+  const inner = /\/>$/.test(rPr) && !rPr.includes("</w:rPr>") ? "" : rPr.slice(rPr.indexOf(">") + 1, rPr.length - "</w:rPr>".length);
+  return { open: m[1], gap: m[2], rPr, inner, end };
+}
 
 /** An opening `<w:p …>` (not self-closing) followed directly by its `<w:pPr`. */
 const P_OPEN_PPR_RE = /<w:p(?:\s[^>]*?)?(?<!\/)>(\s*)<w:pPr(?=[\s/>])/g;
@@ -134,13 +146,12 @@ export function wipeBlockPresentation(blockXml: string, opts: WipeOptions = {}):
     let r = run;
     let changed = false;
 
-    const rp = RUN_RPR_RE.exec(r);
+    const rp = runProps(r);
     if (rp) {
-      const inner = rp[4] ?? "";
-      const next = filterRunProps(inner);
+      const next = filterRunProps(rp.inner);
       const replacement = next ? `<w:rPr>${next}</w:rPr>` : "";
-      if (replacement !== rp[3]) {
-        r = rp[1] + (next ? rp[2] : "") + replacement + r.slice(rp[0].length);
+      if (replacement !== rp.rPr) {
+        r = rp.open + (next ? rp.gap : "") + replacement + r.slice(rp.end);
         changed = true;
         res.runsStripped++;
       }

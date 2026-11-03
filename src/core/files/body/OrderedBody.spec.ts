@@ -10,6 +10,7 @@ import {
   makeStyledParagraphXml,
   makeParagraphXmlLike,
   paragraphText,
+  paragraphPropsXml,
   paragraphStyleId,
   setParagraphText,
   kindOf,
@@ -314,5 +315,12 @@ describe("paragraph writers — tabs round-trip", () => {
     const xml = makeParagraphXmlLike(template, "label\t12");
     expect(xml).toContain('<w:pStyle w:val="TOC2"/>');
     expect(paragraphText(xml)).toBe("label\t12");
+  });
+});
+
+describe("paragraphPropsXml with a tracked property change", () => {
+  test("returns the whole pPr, its nested old properties included", () => {
+    const pPr = '<w:pPr><w:jc w:val="center"/><w:pPrChange w:id="1" w:author="A" w:date="d"><w:pPr><w:jc w:val="left"/></w:pPr></w:pPrChange></w:pPr>';
+    expect(paragraphPropsXml(`<w:p>${pPr}<w:r><w:t>x</w:t></w:r></w:p>`)).toBe(pPr);
   });
 });

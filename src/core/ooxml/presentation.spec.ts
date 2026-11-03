@@ -166,3 +166,17 @@ describe("samples/2.docx", () => {
     expect((await re.document.getBlocks()).length).toBe(blocks.length);
   });
 });
+
+describe("a run with a tracked formatting change", () => {
+  const CHANGE = '<w:rPrChange w:id="1" w:author="A" w:date="d"><w:rPr><w:i/></w:rPr></w:rPrChange>';
+
+  test("the record of the old properties goes, what the run means stays, and nothing throws", () => {
+    const x = `<w:p><w:r><w:rPr><w:b/>${CHANGE}</w:rPr><w:t>x</w:t></w:r></w:p>`;
+    expect(wipe(x).xml).toBe("<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>x</w:t></w:r></w:p>");
+  });
+
+  test("a kept property stays", () => {
+    const x = `<w:p><w:r><w:rPr><w:vertAlign w:val="superscript"/>${CHANGE}</w:rPr><w:t>1</w:t></w:r></w:p>`;
+    expect(wipe(x).xml).toBe('<w:p><w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:t>1</w:t></w:r></w:p>');
+  });
+});

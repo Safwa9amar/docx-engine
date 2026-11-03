@@ -23,6 +23,7 @@
  */
 
 import { canonicalizeParagraphProps } from "./canonicalOrder";
+import { pPrAt } from "./ownPPr";
 import { mergeRunProps, type RunProps } from "./runProps";
 
 /** Word's paragraph pagination toggles. `undefined` = leave as it is. */
@@ -102,8 +103,14 @@ export function insertAfterParagraphOpen(xml: string, fragment: string): string 
   return `${split.head}${fragment}${split.rest}`;
 }
 
-/** Match a leading `<w:pPr>` — self-closing or paired — at the start of a fragment. */
-const LEADING_PPR_RE = /^(\s*)<w:pPr(?:\s*\/>|(?:\s[^>]*?)?>([\s\S]*?)<\/w:pPr>)/;
+/**
+ * A leading `<w:pPr>` — self-closing or paired — at the start of a fragment, matched by depth: a
+ * `w:pPrChange` nests a `w:pPr`, and stopping at the first close would cut the element in two.
+ */
+function leadingPPr(fragment: string): { inner: string; end: number } | null {
+  const own = pPrAt(fragment, 0);
+  return own && { inner: fragment.slice(own.innerStart, own.innerEnd), end: own.end };
+}
 
 /**
  * Read a paragraph's `<w:pPr>` inner XML.
@@ -119,7 +126,7 @@ const LEADING_PPR_RE = /^(\s*)<w:pPr(?:\s*\/>|(?:\s[^>]*?)?>([\s\S]*?)<\/w:pPr>)
 export function readParagraphProps(xml: string): string | null {
   const split = splitParagraph(xml);
   if (!split) return null;
-  return LEADING_PPR_RE.exec(split.rest)?.[2] ?? "";
+  return leadingPPr(split.rest)?.inner ?? "";
 }
 
 /**
@@ -139,9 +146,9 @@ export function updateParagraphProps(xml: string, mutate: (pPrInner: string) => 
   if (!split) {
     throw new Error("paragraphProps.updateParagraphProps: not a <w:p> element");
   }
-  const existing = LEADING_PPR_RE.exec(split.rest);
-  const current = existing?.[2] ?? "";
-  const body = existing ? split.rest.slice(existing[0].length) : split.rest;
+  const existing = leadingPPr(split.rest);
+  const current = existing?.inner ?? "";
+  const body = existing ? split.rest.slice(existing.end) : split.rest;
 
   const next = mutate(current);
   // Byte-identical when nothing changed — including the no-pPr/nothing-to-add
@@ -258,9 +265,9 @@ export function applyRunPropsToParagraph(xml: string, props: RunProps): Paragrap
   // mark's `w:rPr` is not a `w:r`, so RUN_RE could not match it anyway; keeping
   // `w:pPr` out of the replaced span makes that independent of the regex.
   const split = splitParagraph(withMark)!;
-  const pPr = LEADING_PPR_RE.exec(split.rest);
-  const head = split.head + (pPr?.[0] ?? "");
-  const body = pPr ? split.rest.slice(pPr[0].length) : split.rest;
+  const pPr = leadingPPr(split.rest);
+  const head = split.head + (pPr ? split.rest.slice(0, pPr.end) : "");
+  const body = pPr ? split.rest.slice(pPr.end) : split.rest;
 
   let runs = 0;
   const styledBody = body.replace(RUN_RE, (run) => {

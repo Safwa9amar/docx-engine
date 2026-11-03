@@ -241,3 +241,27 @@ describe("upsertSectPrPageBorders", () => {
       .toContain('w:space="13"');
   });
 });
+
+// A tracked paragraph-property change holds the OLD properties in a nested w:pPr, so the first
+// `</w:pPr>` in the paragraph is that nested one. The section break must land in the paragraph's
+// own w:pPr, ahead of w:pPrChange (CT_PPr: rPr, sectPr, pPrChange), or Word reads no section at all.
+describe("upsertParagraphSectPr with a tracked paragraph-property change", () => {
+  const CHANGE = '<w:pPrChange w:id="1" w:author="A" w:date="2026-01-01T00:00:00Z"><w:pPr><w:jc w:val="left"/></w:pPr></w:pPrChange>';
+  const SECT = '<w:sectPr><w:type w:val="nextPage"/></w:sectPr>';
+
+  test("the break goes into the paragraph's own pPr, before the pPrChange", () => {
+    const out = upsertParagraphSectPr(`<w:p><w:pPr><w:jc w:val="center"/>${CHANGE}</w:pPr><w:r><w:t>x</w:t></w:r></w:p>`, SECT);
+    expect(out).toBe(`<w:p><w:pPr><w:jc w:val="center"/>${SECT}${CHANGE}</w:pPr><w:r><w:t>x</w:t></w:r></w:p>`);
+  });
+
+  test("an existing break is replaced in place, and the old properties stay as they were", () => {
+    const out = upsertParagraphSectPr(`<w:p><w:pPr><w:sectPr><w:cols/></w:sectPr>${CHANGE}</w:pPr></w:p>`, SECT);
+    expect(out).toBe(`<w:p><w:pPr>${SECT}${CHANGE}</w:pPr></w:p>`);
+  });
+
+  test("a paragraph with no pPr of its own but a text box gets its own, not the text box's", () => {
+    const box = '<w:r><w:txbxContent><w:p><w:pPr><w:jc w:val="left"/></w:pPr></w:p></w:txbxContent></w:r>';
+    const out = upsertParagraphSectPr(`<w:p>${box}</w:p>`, SECT);
+    expect(out).toBe(`<w:p><w:pPr>${SECT}</w:pPr>${box}</w:p>`);
+  });
+});
