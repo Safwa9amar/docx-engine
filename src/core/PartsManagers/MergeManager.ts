@@ -41,7 +41,9 @@ import { planStyles, retargetListRefs, retargetStyleRefs, stampNumbering, type S
 import { parseXml } from "@/utils/xmlUtils";
 import { carryRootNamespaces } from "@/utils/rootNamespaces";
 import { assembleDocument, splitDocument, type BodyBlock } from "@/core/files/body/OrderedBody";
-import { clearFalseDataDescriptors } from "@/doctor";
+import { clearFalseDataDescriptors, insertBodySpacers } from "@/doctor";
+import { editBodySectPr } from "@/core/files/body/sectPr";
+import { seamSections } from "./mergeSections";
 import { canonicalMainPart, canonicalizeMainPart } from "@/core/package/canonicalMainPart";
 // Imported lazily inside appendDocument() to avoid an index.ts ↔ MergeManager cycle.
 import type { Mdocxengine as MdocxengineType } from "@/index";
@@ -396,6 +398,11 @@ export interface AppendOptions {
   leadingBlocks?: BodyBlock[];
   /** source styleId → target styleId (applied to `<w:pStyle w:val>`). */
   styleMap?: Record<string, string>;
+  /**
+   * Each part's text stays on its own page: a seam of section properties where the source's page or
+   * section breaks need one. Left off, as the combine flow does, the target's template owns the pages.
+   */
+  keepPages?: boolean;
 }
 
 /** A later part wanted its notes numbered or placed otherwise. One final section, one answer. */
@@ -491,9 +498,33 @@ export class MergeManager {
     if (opts.startOnNewPage) prefix.push(pageBreakBlock());
     if (opts.leadingBlocks?.length) prefix.push(...opts.leadingBlocks);
 
-    await this.document.saveBlocks([...existing, ...prefix, ...remapped]);
+    const seam = opts.keepPages
+      ? seamSections(existing, remapped, finalSectPr(this.zip.readAsText("word/document.xml")), finalSectPr(source.zip.readAsText("word/document.xml")))
+      : { existing, incoming: remapped, final: null };
+    const blocks = [...seam.existing, ...prefix, ...seam.incoming];
+    this.keepStoryShape(blocks);
+    await this.document.saveBlocks(blocks);
+    if (seam.final) {
+      const final = seam.final;
+      this.zip.addFile("word/document.xml", Buffer.from(editBodySectPr(this.zip.readAsText("word/document.xml"), () => final), "utf8"));
+    }
     this.carryNamespaces(source);
     return { commentsStripped: commentIds.size, noteConflicts, bindingsDropped };
+  }
+
+  /** The empty paragraphs Word itself keeps between two tables and after a last one. */
+  private keepStoryShape(blocks: BodyBlock[]): number {
+    const { adjacent, trailing } = insertBodySpacers(blocks, blocks.some((b) => b.xml.includes("<w:bidiVisual")));
+    return adjacent + trailing;
+  }
+
+  /** The same for this document as it stands, for one that gets nothing appended. Returns how many went in. */
+  async settleStoryShape(): Promise<number> {
+    canonicalizeMainPart(this.zip);
+    const blocks = await this.document.getBlocks();
+    const added = this.keepStoryShape(blocks);
+    if (added) await this.document.saveBlocks(blocks);
+    return added;
   }
 
   // ─── Comments ───────────────────────────────────────────────────────────────

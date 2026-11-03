@@ -1225,7 +1225,7 @@ function checkBody(zip: DocxZip, fix: boolean): { findings: Finding[]; rewrote: 
 
 /** Insert the empty paragraphs Word keeps between/after tables. Mutates `blocks`
  *  and returns how many spots needed one. */
-function insertBodySpacers(blocks: BodyBlock[], rtl: boolean): { adjacent: number; trailing: number } {
+export function insertBodySpacers(blocks: BodyBlock[], rtl: boolean): { adjacent: number; trailing: number } {
   const spacer = (): BodyBlock => ({
     kind: "paragraph",
     tag: "w:p",
