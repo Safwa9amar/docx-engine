@@ -119,6 +119,17 @@ describe("a part's main document is the one its package names", () => {
     await expect(merge(first(), later.toBuffer())).rejects.toThrow(/main document/);
   });
 
+  test("a second theme beside the first is no reason to refuse", async () => {
+    const theme = `${XML_HEAD}<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="x"/>`;
+    const later = fixture({
+      body: P("Avec deux themes."),
+      parts: { "word/theme/theme1.xml": theme, "word/theme/theme2.xml": theme },
+      docRels: `<Relationship Id="rIdT" Type="${R_NS}/theme" Target="theme/theme2.xml"/><Relationship Id="rIdU" Type="${R_NS}/aFChunk" Target="theme/theme1.xml"/>`,
+    });
+    expect(canonicalMainPart(later).equals(later)).toBe(true);
+    expect(await words(await merge(first(), later))).toBe("Un. Avec deux themes.");
+  });
+
   test("the first part may be the renamed one too", async () => {
     const a = renamed(fixture({ body: P("Mots du premier.") }), { "word/document.xml": "word/document2.xml" });
     const out = await merge(a, fixture({ body: P("Deux.") }));

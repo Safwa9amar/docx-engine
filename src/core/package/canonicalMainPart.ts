@@ -34,6 +34,9 @@ const FIXED_PARTS: Record<string, string> = {
   theme: "word/theme/theme1.xml",
 };
 
+/** Only worth moving onto a free name: nothing is lost if another part already has it. */
+const MOVED_IF_FREE = new Set(["fontTable", "webSettings", "theme"]);
+
 const RELATIONSHIP = /<(?:[\w.-]+:)?Relationship\b(?:"[^"]*"|'[^']*'|[^>"'])*>/g;
 const OVERRIDE = /<(?:[\w.-]+:)?Override\b(?:"[^"]*"|'[^']*'|[^>"'])*>(?:\s*<\/(?:[\w.-]+:)?Override>)?/g;
 const attr = (tag: string, name: string) => new RegExp(`\\s${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`).exec(tag);
@@ -120,9 +123,11 @@ export function canonicalizeMainPart(zip: AdmZip): number {
   const moves = new Map<string, string>();
   if (main !== CANONICAL_MAIN) moves.set(main, CANONICAL_MAIN);
   for (const m of read(zip, lookup(relsOf(main))).matchAll(RELATIONSHIP)) {
-    const dest = FIXED_PARTS[/[^/]*$/.exec(attrValue(m[0], "Type") ?? "")?.[0] ?? ""];
+    const type = /[^/]*$/.exec(attrValue(m[0], "Type") ?? "")?.[0] ?? "";
+    const dest = FIXED_PARTS[type];
     const target = attrValue(m[0], "Target");
     if (!dest || target === undefined || attrValue(m[0], "TargetMode") === "External") continue;
+    if (MOVED_IF_FREE.has(type) && lookup(dest)) continue;
     const entry = lookup(resolve(main, target));
     if (entry && entry !== dest && !moves.has(entry) && ![...moves.values()].includes(dest)) moves.set(entry, dest);
   }
