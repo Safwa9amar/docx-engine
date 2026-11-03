@@ -1,6 +1,6 @@
 import { describe, test, expect } from "vitest";
 import { Mdocxengine, type BodyBlock } from "../index";
-import { fixture, note, notesPart, type FixtureOptions } from "./docx-fixture";
+import { fixture, note, notesPart, P, type FixtureOptions } from "./docx-fixture";
 
 /**
  * Ids that must stay unique across a merge: `wp:docPr/@id`, `w:bookmarkStart/@w:id`
@@ -160,5 +160,122 @@ describe("a renamed bookmark's references follow it everywhere", () => {
       footnotes: notesPart("footnote", note("footnote", 1, `<w:p><w:bookmarkStart w:id="5" w:name="_Ref100"/><w:r><w:t>n</w:t></w:r><w:bookmarkEnd w:id="5"/></w:p>`)),
     });
     expect(notes).toContain('w:name="_Ref100_m1"');
+  });
+});
+
+describe("Word reads bookmark names without regard to case", () => {
+  const code = (xml: string) => all(xml, /<w:instrText[^>]*>([^<]*)<\/w:instrText>/g).map((c) => c.trim());
+  const names = (xml: string) => all(xml, /<w:bookmarkStart\b[^>]*\bw:name="([^"]*)"/g);
+  const merged = async (first: string[], second: string[]) => {
+    const t = await doc(first);
+    await t.merge.appendDocument((await doc(second)).zip.toBuffer(), {});
+    return body(t);
+  };
+
+  test("names differing only by case collide, and the later one's references follow", async () => {
+    const xml = await merged([bm(1, "Resultat", "a"), field("REF Resultat \\h")], [bm(1, "RESULTAT", "b"), field("REF RESULTAT \\h")]);
+    expect(names(xml)).toEqual(["Resultat", "RESULTAT_m1"]);
+    expect(code(xml)).toEqual(["REF Resultat \\h", "REF RESULTAT_m1 \\h"]);
+  });
+
+  test("a reference written in another case than its bookmark follows it", async () => {
+    const xml = await merged([bm(1, "res1", "a")], [bm(1, "res1", "b"), field("REF RES1 \\h"), `<w:p><w:hyperlink w:anchor="RES1"><w:r><w:t>lien</w:t></w:r></w:hyperlink></w:p>`]);
+    expect(code(xml)).toEqual(["REF res1_m1 \\h"]);
+    expect(xml).toContain('w:anchor="res1_m1"');
+  });
+
+  test("a free name is looked for without regard to case too", async () => {
+    const xml = await merged([bm(1, "res", "a"), bm(2, "RES_M1", "a2")], [bm(1, "res", "b")]);
+    expect(names(xml)).toEqual(["res", "RES_M1", "res_m2"]);
+  });
+
+  test("a part's own two spellings of one name stay one name", async () => {
+    const xml = await merged([bm(1, "res", "a")], [bm(1, "res", "b"), bm(2, "RES", "c"), field("REF RES")]);
+    expect(names(xml)).toEqual(["res", "res_m1", "res_m1"]);
+    expect(code(xml)).toEqual(["REF res_m1"]);
+  });
+
+  test("a new name stays within Word's forty characters", async () => {
+    const long = "Chapitre_resultats_de_terrain_annee_2024";
+    expect(long).toHaveLength(40);
+    const xml = await merged([bm(1, long, "a")], [bm(1, long, "b"), field(`REF ${long} \\h`)]);
+    const [, renamed] = names(xml);
+    expect(renamed.length).toBeLessThanOrEqual(40);
+    expect(renamed.toLowerCase()).not.toBe(long.toLowerCase());
+    expect(code(xml)).toEqual([`REF ${renamed} \\h`]);
+  });
+
+  test("a bookmark in this document's notes takes its name too", async () => {
+    const t = await Mdocxengine.loadFromBuffer(
+      fixture({ body: P("Un") + `<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>`, footnotes: notesPart("footnote", note("footnote", 1, bm(7, "res", "note"))) }),
+    );
+    await t.merge.appendDocument(fixture({ body: bm(1, "RES", "b") }), {});
+    expect(names(await body(t))).toEqual(["RES_m1"]);
+    const ids = all(await body(t), /<w:bookmarkStart\b[^>]*\bw:id="(\d+)"/g);
+    expect(Number(ids[0])).toBeGreaterThan(7);
+  });
+});
+
+describe("a field names a bookmark in more ways than REF", () => {
+  const code = (xml: string) => all(xml, /<w:instrText[^>]*>([^<]*)<\/w:instrText>/g).map((c) => c.trim());
+  const after = async (...codes: string[]) => {
+    const t = await doc([bm(1, "res1", "a")]);
+    await t.merge.appendDocument((await doc([bm(1, "res1", "b"), ...codes.map(field)])).zip.toBuffer(), {});
+    return code(await body(t));
+  };
+
+  test.each([
+    ["ref res1 \\h", "ref res1_m1 \\h"],
+    ["Ref res1", "Ref res1_m1"],
+    ["pageref res1", "pageref res1_m1"],
+    ["noteref res1 \\f", "noteref res1_m1 \\f"],
+    ['REF "res1"', 'REF "res1_m1"'],
+    ["REF &quot;res1&quot; \\h", "REF &quot;res1_m1&quot; \\h"],
+    ["res1", "res1_m1"],
+    ["RES1", "res1_m1"],
+    ["res1 \\* Upper", "res1_m1 \\* Upper"],
+    ['HYPERLINK \\l "res1"', 'HYPERLINK \\l "res1_m1"'],
+    ["hyperlink \\l res1", "hyperlink \\l res1_m1"],
+    ['HYPERLINK "https://exemple.invalid/" \\l "res1"', 'HYPERLINK "https://exemple.invalid/" \\l "res1_m1"'],
+    ["TOC \\b res1", "TOC \\b res1_m1"],
+    ["toc \\o 1-3 \\b res1 \\h", "toc \\o 1-3 \\b res1_m1 \\h"],
+    ["INDEX \\b res1", "INDEX \\b res1_m1"],
+    ["SEQ Figure res1", "SEQ Figure res1_m1"],
+    ["=res1*2", "=res1_m1*2"],
+    ["= SUM(res1, 3)", "= SUM(res1_m1, 3)"],
+    ['IF res1 > 0 "res1" "non"', 'IF res1_m1 > 0 "res1" "non"'],
+  ])("%s", async (from, to) => {
+    expect(await after(from)).toEqual([to]);
+  });
+
+  test.each([
+    ["PAGE"],
+    ['REF other \\h'],
+    ['HYPERLINK "res1"'],
+    ["TOC \\o 1-3"],
+    ["SEQ res1"],
+    ["TA \\l res1 \\b"],
+    ['=otherres1*2'],
+  ])("%s stays as it is", async (c) => {
+    expect(await after(c)).toEqual([c]);
+  });
+
+  test("a bookmark that shares its name with a field keeps the field a field", async () => {
+    const t = await doc([bm(1, "page", "a")]);
+    await t.merge.appendDocument((await doc([bm(1, "page", "b"), field("PAGE"), field("REF page")])).zip.toBuffer(), {});
+    expect(code(await body(t))).toEqual(["PAGE", "REF page_m1"]);
+  });
+
+  test("a code split across runs, in another case, is one code", async () => {
+    const split = `<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> ref re</w:instrText></w:r><w:r><w:instrText>s1 \\h </w:instrText></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>`;
+    const t = await doc([bm(1, "res1", "a")]);
+    await t.merge.appendDocument((await doc([bm(1, "res1", "b"), split])).zip.toBuffer(), {});
+    expect(code(await body(t)).join("")).toBe("ref res1_m1 \\h");
+  });
+
+  test("a simple field too", async () => {
+    const t = await doc([bm(1, "res1", "a")]);
+    await t.merge.appendDocument((await doc([bm(1, "res1", "b"), `<w:p><w:fldSimple w:instr=" ref res1 "><w:r><w:t>x</w:t></w:r></w:fldSimple></w:p>`])).zip.toBuffer(), {});
+    expect(await body(t)).toContain('w:instr=" ref res1_m1 "');
   });
 });

@@ -219,6 +219,79 @@ function rewriteFieldCodes(xml: string, fix: (code: string) => string): string {
   return out;
 }
 
+// ─── Bookmark names ─────────────────────────────────────────────────────────
+
+const bookmarkKey = (name: string) => name.toLowerCase();
+const BOOKMARK_NAME_MAX = 40;
+/** A name not yet in use, within what Word allows: it does not keep a longer one. */
+function renamedBookmark(name: string, k: number): string {
+  const suffix = `_m${k}`;
+  return name.slice(0, BOOKMARK_NAME_MAX - suffix.length) + suffix;
+}
+
+/** A word at the head of a field is its type when Word knows it, and a bookmark only otherwise. */
+const FIELD_TYPES = new Set(
+  ("addin addressblock advance ask author autonum autonumlgl autonumout autotext autotextlist barcode bibliography bidioutline citation " +
+    "comments compare createdate database date docproperty docvariable edittime eq filename filesize fillin formcheckbox formdropdown " +
+    "formtext ftnref gotobutton greetingline hyperlink if includepicture includetext index info keywords lastsavedby link listnum " +
+    "macrobutton mergefield mergerec mergeseq next nextif noteref numchars numpages numwords page pageref print printdate private quote " +
+    "rd ref revnum savedate section sectionpages seq set skipif styleref subject symbol ta tc template time title toa toc useraddress " +
+    "userinitials username xe").split(" "),
+);
+const FIELD_TOKEN = /&quot;[\s\S]*?&quot;|"[^"]*"|[^\s"]+/g;
+const unquoted = (token: string) => token.replace(/^(?:&quot;|")|(?:&quot;|")$/g, "");
+const isQuoted = (token: string) => /^(?:&quot;|")/.test(token);
+const afterSwitch = (tokens: string[], name: string) => {
+  const at = tokens.findIndex((t) => t.toLowerCase() === name);
+  return at < 0 ? -1 : at + 1;
+};
+
+/**
+ * Which word of a field code is a bookmark, and put the new name there. Field codes are not
+ * case-sensitive, and a field can be nothing but the bookmark's name.
+ */
+function renameBookmarksInField(code: string, renames: Map<string, string>): string {
+  const tokens = [...code.matchAll(FIELD_TOKEN)];
+  if (!tokens.length) return code;
+  const words = tokens.map((m) => m[0]);
+  const type = unquoted(words[0]).toLowerCase();
+
+  const rewrite = (edit: (token: string, i: number) => string) => {
+    let out = "";
+    let at = 0;
+    tokens.forEach((m, i) => {
+      out += code.slice(at, m.index!) + edit(m[0], i);
+      at = m.index! + m[0].length;
+    });
+    return out + code.slice(at);
+  };
+
+  // A formula names bookmarks as its operands, anywhere that is not a quoted string.
+  if (type.startsWith("=") || type === "if") {
+    return rewrite((token) => {
+      if (isQuoted(token)) return token;
+      let out = token;
+      for (const [key, to] of renames) {
+        const name = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        out = out.replace(new RegExp(`(?<![\\p{L}\\p{N}_&])${name}(?![\\p{L}\\p{N}_])`, "giu"), to);
+      }
+      return out;
+    });
+  }
+
+  let at = -1;
+  if (type === "ref" || type === "pageref" || type === "noteref") at = 1;
+  else if (type === "hyperlink") at = afterSwitch(words, "\\l");
+  else if (type === "toc" || type === "index" || type === "toa") at = afterSwitch(words, "\\b");
+  else if (type === "seq") at = words[2]?.startsWith("\\") ? -1 : 2;
+  else if (!FIELD_TYPES.has(type)) at = 0;
+  if (at < 0 || at >= words.length) return code;
+
+  const renamed = renames.get(bookmarkKey(unquoted(words[at])));
+  if (!renamed) return code;
+  return rewrite((token, i) => (i === at ? token.replace(unquoted(token), renamed) : token));
+}
+
 /** Elements whose relationship attributes have a path of their own, or which a merge removes. */
 const REL_OWN_PATH = new Set([
   "w:hyperlink", "c:chart", "v:imagedata", "v:fill", "o:OLEObject", "w:headerReference", "w:footerReference", "w:printerSettings",
@@ -869,7 +942,8 @@ export class MergeManager {
   // cross-reference jump to the wrong part).
 
   private planIds(blocksXml: string): IdPlan {
-    const targetXml = this.zip.readAsText("word/document.xml") ?? "";
+    // The notes hold bookmarks too, and every story shares one set of names and ids.
+    const targetXml = ["word/document.xml", "word/footnotes.xml", "word/endnotes.xml"].map((p) => this.zip.readAsText(p) ?? "").join("\n");
     const maxOf = (re: RegExp) =>
       [...targetXml.matchAll(re)].reduce((m, x) => Math.max(m, parseInt(x[1], 10) || 0), 0);
 
@@ -878,22 +952,24 @@ export class MergeManager {
     // its own new id, handed out in document order by applyIdPlan.
     let nextBm = maxOf(/<w:bookmarkStart\b[^>]*\bw:id="(\d+)"/g);
     const bmIds = new Map<string, string>();
+    // Word's bookmark names are not case-sensitive: "Resultat" and "RESULTAT" are one bookmark.
     const taken = new Set(
-      [...targetXml.matchAll(/<w:bookmarkStart\b[^>]*\bw:name="([^"]*)"/g)].map((m) => m[1]),
+      [...targetXml.matchAll(/<w:bookmarkStart\b[^>]*\bw:name="([^"]*)"/g)].map((m) => bookmarkKey(m[1])),
     );
-    const srcNames = new Set(
-      [...blocksXml.matchAll(/<w:bookmarkStart\b[^>]*\bw:name="([^"]*)"/g)].map((m) => m[1]),
-    );
+    const srcNames = new Map<string, string>();
+    for (const m of blocksXml.matchAll(/<w:bookmarkStart\b[^>]*\bw:name="([^"]*)"/g)) {
+      if (!srcNames.has(bookmarkKey(m[1]))) srcNames.set(bookmarkKey(m[1]), m[1]);
+    }
     const renames = new Map<string, string>();
     for (const m of blocksXml.matchAll(/<w:bookmark(?:Start|End)\b[^>]*\bw:id="([^"]+)"/g)) {
       if (!bmIds.has(m[1])) bmIds.set(m[1], String(++nextBm));
     }
-    for (const name of srcNames) {
-      if (!taken.has(name)) continue;
+    for (const [key, name] of srcNames) {
+      if (!taken.has(key)) continue;
       let k = 1;
-      while (taken.has(`${name}_m${k}`) || srcNames.has(`${name}_m${k}`)) k++;
-      renames.set(name, `${name}_m${k}`);
-      taken.add(`${name}_m${k}`);
+      while (taken.has(bookmarkKey(renamedBookmark(name, k))) || srcNames.has(bookmarkKey(renamedBookmark(name, k)))) k++;
+      renames.set(key, renamedBookmark(name, k));
+      taken.add(bookmarkKey(renamedBookmark(name, k)));
     }
     return { nextDoc: () => ++nextDoc, bmIds, renames };
   }
@@ -907,7 +983,10 @@ export class MergeManager {
       out = out.replace(/<w:bookmark(Start|End)\b[^>]*>/g, (tag) => {
         let t = tag.replace(/(\bw:id=")([^"]+)(")/, (f, a, v, c) => (plan.bmIds.has(v) ? `${a}${plan.bmIds.get(v)}${c}` : f));
         if (tag.startsWith("<w:bookmarkStart")) {
-          t = t.replace(/(\bw:name=")([^"]*)(")/, (f, a, v, c) => (plan.renames.has(v) ? `${a}${plan.renames.get(v)}${c}` : f));
+          t = t.replace(/(\bw:name=")([^"]*)(")/, (f, a, v, c) => {
+            const renamed = plan.renames.get(bookmarkKey(v));
+            return renamed ? `${a}${renamed}${c}` : f;
+          });
         }
         return t;
       });
@@ -916,24 +995,15 @@ export class MergeManager {
     return out;
   }
 
-  /** Point REF/PAGEREF/NOTEREF/HYPERLINK \l fields and `w:anchor` at renamed bookmarks. Quotes
-   *  stand escaped in an attribute, and may in a field code too. */
+  /** Point the fields and every `w:anchor` naming a renamed bookmark at its new name. */
   private renameBookmarkRefs(xml: string, renames: Map<string, string>): string {
-    const fix = (instr: string) => {
-      let r = instr;
-      for (const [from, to] of renames) {
-        const f = from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        r = r
-          .replace(new RegExp(`(\\b(?:REF|PAGEREF|NOTEREF)\\s+(?:"|&quot;)?)${f}(?=(?:"|&quot;)?(?:\\s|$))`, "g"), (_m, a) => a + to)
-          .replace(new RegExp(`(\\\\l\\s+(?:"|&quot;))${f}(?="|&quot;)`, "g"), (_m, a) => a + to);
-      }
-      return r;
-    };
+    const fix = (code: string) => renameBookmarksInField(code, renames);
     return rewriteFieldCodes(xml, fix)
       .replace(/(\bw:instr=")([^"]*)(")/g, (_m, a, t, c) => a + fix(t) + c)
-      .replace(/(<w:hyperlink\b[^>]*\bw:anchor=")([^"]*)(")/g, (m, a, v, c) =>
-        renames.has(v) ? `${a}${renames.get(v)}${c}` : m,
-      );
+      .replace(/(<w:hyperlink\b[^>]*\bw:anchor=")([^"]*)(")/g, (m, a, v, c) => {
+        const renamed = renames.get(bookmarkKey(v));
+        return renamed ? `${a}${renamed}${c}` : m;
+      });
   }
 
   // ─── Charts (part-closure copy) ─────────────────────────────────────────────
