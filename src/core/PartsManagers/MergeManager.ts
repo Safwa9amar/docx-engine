@@ -238,6 +238,8 @@ const FIELD_TYPES = new Set(
     "rd ref revnum savedate section sectionpages seq set skipif styleref subject symbol ta tc template time title toa toc useraddress " +
     "userinitials username xe").split(" "),
 );
+/** Whether a word at the head of a field code is the field's type, and not a bookmark's name. */
+export const isWordFieldType = (word: string) => FIELD_TYPES.has(word.toLowerCase());
 const FIELD_TOKEN = /&quot;[\s\S]*?&quot;|"[^"]*"|[^\s"]+/g;
 const unquoted = (token: string) => token.replace(/^(?:&quot;|")|(?:&quot;|")$/g, "");
 const isQuoted = (token: string) => /^(?:&quot;|")/.test(token);
