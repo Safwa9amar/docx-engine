@@ -131,6 +131,24 @@ const TOC_ENTRY_STYLE = (level: number) => ({
 });
 
 /**
+ * What the `TC` fields of a paragraph put in a table of contents. A title drawn in a shape (WordArt, a
+ * text box) is no text of its paragraph, so Word's `\\o` never collects it: a TC field is how it gets a
+ * line, on its true page, printing nothing. Word collects one only when its runs are NOT hidden, and the
+ * table's instruction carries `\\f`: measured in real Word, 2026-11-04.
+ */
+export function tcFieldEntries(paragraphXml: string): Array<{ text: string; level: number }> {
+  const out: Array<{ text: string; level: number }> = [];
+  for (const m of paragraphXml.matchAll(/<w:instrText\b[^>]*>([^<]*)<\/w:instrText>/g)) {
+    const code = decodeXmlText(m[1]);
+    const tc = /^\s*TC\s+"((?:[^"\\]|\\.)*)"([\s\S]*)$/.exec(code);
+    if (!tc) continue;
+    const level = /\\l\s*"?(\d)"?/.exec(tc[2])?.[1];
+    out.push({ text: tc[1].replace(/\\(.)/g, "$1").trim(), level: level ? Number(level) : 1 });
+  }
+  return out;
+}
+
+/**
  * The document's Table of Contents — Word's References → Table of Contents.
  *
  * Every read/write goes through DocumentManager's ORDER-PRESERVING block API
@@ -231,11 +249,12 @@ export class TableOfContentsManager {
   }
 
   /** The `TOC` field instruction, mirroring the switches Word writes. */
-  private buildInstrText(options: TocOptions, depth: number): string {
+  private buildInstrText(options: TocOptions, depth: number, tcFields = false): string {
     let instr = ` TOC \\o "1-${depth}"`;
     if (options.useHyperlinks !== false)   instr += " \\h";
     if (options.includePageNumbers === false) instr += " \\n";     // omit page numbers
     instr += " \\z \\u ";
+    if (tcFields) instr += "\\f ";
     return instr;
   }
 
@@ -328,14 +347,18 @@ export class TableOfContentsManager {
     const blocks    = await this.doc.getBlocks();
     const nextBm    = this.bookmarkSeries();
     const entries: Array<{ text: string; level: number; anchor: string }> = [];
+    let tcFields = false;
 
     for (let i = 0; i < blocks.length; i++) {
       const b = blocks[i];
       if (b.kind !== "paragraph") continue;
-      const level = paragraphHeadingLevel(b.xml);
-      if (level < 1 || level > depth) continue;
-      const text = paragraphText(b.xml).trim();
-      if (!text) continue;                            // an empty heading has nothing to list
+      const fields = tcFieldEntries(b.xml);
+      if (fields.length) tcFields = true;
+      // A TC field says what its paragraph is listed as: Word reads no heading text out of a shape.
+      const wanted = fields.length
+        ? fields.filter((f) => f.text && f.level >= 1 && f.level <= depth)
+        : [{ text: paragraphText(b.xml).trim(), level: paragraphHeadingLevel(b.xml) }].filter((f) => f.text && f.level >= 1 && f.level <= depth);
+      if (!wanted.length) continue;
 
       let anchor = this.existingAnchor(b.xml);
       if (!anchor) {
@@ -343,11 +366,11 @@ export class TableOfContentsManager {
         blocks[i] = { ...b, xml: this.addAnchor(b.xml, bm) };
         anchor = bm.name;
       }
-      entries.push({ text, level, anchor });
+      for (const w of wanted) entries.push({ text: w.text, level: w.level, anchor });
     }
 
     const heading   = options.title !== undefined ? options.title : "Table of Contents";
-    const instrText = this.buildInstrText(options, depth);
+    const instrText = this.buildInstrText(options, depth, tcFields);
     const rPr       = rtl ? "<w:rPr><w:rtl/></w:rPr>" : "";
     const bidi      = rtl ? "<w:bidi/>" : "";
     const para = (xml: string): BodyBlock => ({ kind: "paragraph", tag: "w:p", xml });

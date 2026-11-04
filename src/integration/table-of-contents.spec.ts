@@ -39,6 +39,45 @@ async function texts(e: Mdocxengine): Promise<string[]> {
 
 const xmlOf = (e: Mdocxengine): string => e.zip.readAsText("word/document.xml")!;
 
+describe("insertTOC — a title Word cannot read off the page", () => {
+  const tc = (code: string) =>
+    `<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve">${code}</w:instrText></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>`;
+  const holder = (code: string, style = ""): BodyBlock => ({
+    kind: "paragraph",
+    tag: "w:p",
+    xml: `<w:p>${style ? `<w:pPr><w:pStyle w:val="${style}"/></w:pPr>` : ""}${tc(code)}</w:p>`,
+  });
+
+  test("a TC field gets its entry, in document order, and the field collects TC fields", async () => {
+    const e = await docOf([heading("Introduction"), holder(' TC "Chapitre &amp; un" \\l "1" '), heading("Section", 2)]);
+    const r = await e.toc.insertTOC({ title: "", headingDepth: 3 }, 0);
+    expect(r.entries).toBe(3);
+    const lines = (await texts(e)).filter((t) => t.includes("\t"));
+    expect(lines.map((l) => l.split("\t")[0])).toEqual(["Introduction", "Chapitre & un", "Section"]);
+    expect(xmlOf(e)).toMatch(/TOC \\o "1-3" \\h \\z \\u \\f /);
+  });
+
+  test("a heading holding a TC field is listed once, by what the field says", async () => {
+    const e = await docOf([holder(' TC "Titre \\"cit\u00e9\\" ici" \\l "1" ', "Heading1")]);
+    const r = await e.toc.insertTOC({ title: "", headingDepth: 3 }, 0);
+    expect(r.entries).toBe(1);
+    expect((await texts(e)).filter((t) => t.includes("\t")).map((l) => l.split("\t")[0])).toEqual(['Titre "cit\u00e9" ici']);
+  });
+
+  test("the level comes from the field, and one too deep is left out", async () => {
+    const e = await docOf([holder(' TC "Profond" \\l "4" '), holder(' TC "Moyen" \\l "2" ')]);
+    const r = await e.toc.insertTOC({ title: "", headingDepth: 3 }, 0);
+    expect(r.entries).toBe(1);
+    expect(xmlOf(e)).toContain('<w:pStyle w:val="TOC2"/>');
+  });
+
+  test("no TC field: the instruction is what it always was", async () => {
+    const e = await docOf([heading("Introduction")]);
+    await e.toc.insertTOC({ title: "" }, 0);
+    expect(xmlOf(e)).not.toMatch(/TOC [^<]*\\f/);
+  });
+});
+
 describe("insertTOC — the field", () => {
   test("writes a real TOC field with the requested depth", async () => {
     const e = await docOf([heading("Introduction"), "body", heading("Method")]);
