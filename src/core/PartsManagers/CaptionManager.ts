@@ -478,7 +478,7 @@ const KIND_LABELS: Record<CaptionKind, string[]> = {
   figure: [
     "figure", "fig.", "fig", "illustration", "illus.", "schéma", "schema",
     "graphique", "graph.", "photo", "photographie", "image", "carte", "diagramme",
-    "الشكل رقم", "شكل رقم", "الشكل", "شكل", "الصورة", "صورة",
+    "الشكل رقم", "شكل رقم", "الشكل البياني", "شكل بياني", "الشكل", "شكل", "الصورة", "صورة",
     "الرسم البياني", "الرسم", "رسم", "الخريطة", "خريطة",
   ],
   table: [
@@ -733,6 +733,27 @@ export function removeLeadingWord(paragraphXml: string, word: string): { xml: st
     : runTail.trim() === "" ? ""
     : `${head}${runProps}${runTail}</w:r>`;
   return { xml: `${open}${prefix}${lead}${newRun}${after}${close}`, dropped: true };
+}
+
+const LEADING_SPACES_RUN = new RegExp(
+  "^((?:\\s*<w:(?:bookmarkStart|bookmarkEnd|proofErr)\\b[^>]*/>)*\\s*<w:r(?:\\s[^>]*)?>(?:<w:rPr>[\\s\\S]*?</w:rPr>|<w:rPr/>)?)" +
+  `<w:t((?:\\s[^>]*)?)>(${TYPED_SPACE}+)([^<]*)</w:t>(\\s*</w:r>)`,
+);
+
+/**
+ * Wording's run XML without the spaces typed in front of it. A run of nothing but spaces goes, and the
+ * next one is read too. Stops at anything else: a tab, a field, a picture, a link stays where it stands.
+ */
+function withoutLeadingSpaces(rest: string): string {
+  let out = rest;
+  for (;;) {
+    const m = LEADING_SPACES_RUN.exec(out);
+    if (!m) return out;
+    const [all, head, attrs, , text, close] = m;
+    if (text !== "") return `${head}<w:t${attrs}>${text}</w:t>${close}${out.slice(all.length)}`;
+    const lead = /^(?:\s*<w:(?:bookmarkStart|bookmarkEnd|proofErr)\b[^>]*\/>)*\s*/.exec(head)![0];
+    out = lead + out.slice(all.length);
+  }
 }
 
 /**
@@ -1255,7 +1276,9 @@ export class CaptionManager {
     const shell = paragraphShell(source);
     const inner = source.slice(shell.head.length, source.endsWith("</w:p>") ? source.length - "</w:p>".length : source.length);
     const pPr   = paragraphPropsXml(source);
-    const rest  = pPr ? inner.slice(inner.indexOf(pPr) + pPr.length) : inner;
+    const after = pPr ? inner.slice(inner.indexOf(pPr) + pPr.length) : inner;
+    // The separator brings its own space: spaces typed in front of the wording would open a gap after it.
+    const rest  = cut?.dropped ? after : withoutLeadingSpaces(after);
 
     let sep = opts.textSeparator ?? ": ";
     // The space the word left in the next run is the separator's own: do not write it twice.

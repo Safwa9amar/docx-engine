@@ -60,6 +60,19 @@ describe("parseTextCaption — detection", () => {
   });
 });
 
+describe("parseTextCaption — a label with its adjective", () => {
+  test("الشكل البياني رقم (7): is a figure's label and number, not wording", () => {
+    expect(parseTextCaption("الشكل البياني رقم (7): وصف قصير")).toMatchObject({
+      kind: "figure", rawLabel: "الشكل البياني رقم", rawNumber: "7", text: "وصف قصير",
+    });
+    expect(parseTextCaption("شكل بياني 3 - وصف قصير")).toMatchObject({ kind: "figure", rawLabel: "شكل بياني", rawNumber: "3" });
+  });
+
+  test("the words alone, with nothing marking a caption, stay a sentence", () => {
+    expect(parseTextCaption("الشكل البياني يوضح أن النتائج تحسنت كثيرا في هذه المرحلة من العمل الميداني")).toBeNull();
+  });
+});
+
 describe("CaptionManager.convertTextCaptions", () => {
   test("rewrites a typed caption as a real SEQ field, in place", async () => {
     const e = await docOf(["Intro", "Figure 1 : Organigramme de l'entreprise", "Suite"]);

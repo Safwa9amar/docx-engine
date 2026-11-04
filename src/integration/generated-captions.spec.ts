@@ -332,3 +332,18 @@ describe("convertTextCaptions — textSeparator override", () => {
     expect(paragraphText((await e.document.getBlocks())[1].xml)).toBe("Tableau 1");
   });
 });
+
+describe("addGeneratedCaption — spaces typed in front of the wording", () => {
+  test("they do not stand between the separator and the words", async () => {
+    const e = await docOf([para(run("          وصف قصير") + run(" آخر"))]);
+    const r = await e.captions.addGeneratedCaption(0, { kind: "figure", label: "شكل", rtl: true, textSeparator: ": " });
+    expect(r.ok).toBe(true);
+    expect(paragraphText((await e.document.getBlocks())[0].xml)).toBe("شكل 1: وصف قصير آخر");
+  });
+
+  test("a run of nothing but spaces goes, and the run after it loses its own", async () => {
+    const e = await docOf([para(run("   ") + run("  وصف"))]);
+    await e.captions.addGeneratedCaption(0, { kind: "figure", label: "شكل", rtl: true, textSeparator: ": " });
+    expect(paragraphText((await e.document.getBlocks())[0].xml)).toBe("شكل 1: وصف");
+  });
+});
