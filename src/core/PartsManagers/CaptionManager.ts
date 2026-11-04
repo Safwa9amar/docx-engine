@@ -150,6 +150,8 @@ export interface ConvertTextCaptionsOptions {
   kind?: CaptionKind | "all";
   /** Force the label to write, e.g. "Tableau". Only honoured for a single `kind`. */
   label?: string;
+  /** The caller knows these paragraphs are captions: see parseTextCaption. */
+  known?: boolean;
   /**
    * Numbering, as in Word's dialog. Omit for plain sequential numbers
    * ("Figure 1", "Figure 2", …); set `includeChapterNumber` for per-chapter
@@ -571,21 +573,23 @@ export interface TextCaptionMatch {
  * needs a caption label at the very START of the paragraph plus either a number
  * or punctuation after it, and prose that runs on ("Figure 1 shows that …")
  * is rejected: with no punctuation the remainder must be short and must not
- * open with a lowercase word.
+ * open with a lowercase word. `known`: the caller already knows this paragraph
+ * is a caption (a role says so), so a numbered label is one whatever follows it.
  */
-export function parseTextCaption(text: string): TextCaptionMatch | null {
-  const plain = parseCaptionBody(text, false);
+export function parseTextCaption(text: string, opts: { known?: boolean } = {}): TextCaptionMatch | null {
+  const known = opts.known === true;
+  const plain = parseCaptionBody(text, false, known);
   if (plain) return plain;
   // "2- جدول البيان": a typed list number in front is a caption number too.
   const lead = LEAD_NUMBER_RE.exec(text);
   if (!lead) return null;
-  const inner = parseCaptionBody(text.slice(lead[0].length), true);
+  const inner = parseCaptionBody(text.slice(lead[0].length), true, known);
   if (!inner) return null;
   const leadingNumber = lead[1].replace(/[\s\u00A0]+/g, "");
   return { ...inner, rawNumber: inner.rawNumber || leadingNumber, leadingNumber };
 }
 
-function parseCaptionBody(text: string, hasLead: boolean): TextCaptionMatch | null {
+function parseCaptionBody(text: string, hasLead: boolean, known: boolean): TextCaptionMatch | null {
   const m = TEXT_CAPTION_RE.exec(text);
   if (!m) return null;
 
@@ -603,6 +607,8 @@ function parseCaptionBody(text: string, hasLead: boolean): TextCaptionMatch | nu
   if (!rawNumber && !punctuated && !hasLead) return null;
   // A typed list number in front of a bare label ("2- Figure") is not a caption.
   if (hasLead && !rawNumber && !punctuated && !body) return null;
+  // Told it is a caption, a label and a number are enough: the guards below are against prose read as one.
+  if (known && rawNumber) return { kind, rawLabel: normalizeLabel(rawLabel), rawNumber, separator, text: body, leadingNumber: "" };
   if (body.length > 300) return null;
   if (!punctuated && body && (body.length > 80 || /^\p{Ll}/u.test(body))) return null;
 
@@ -1145,7 +1151,7 @@ export class CaptionManager {
       eachParagraph(block.xml).forEach((para, paraOrdinal) => {
         const text = paragraphText(para.xml).trim();
         if (!text) return;
-        const match = parseTextCaption(text);
+        const match = parseTextCaption(text, { known: opts.known === true });
         if (!match || !wantedKinds.has(match.kind)) return;
 
         const note = (reason: SkipReason) => skipped.push({ blockIndex: i, reason, text });

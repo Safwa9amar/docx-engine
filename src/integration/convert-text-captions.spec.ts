@@ -307,3 +307,30 @@ describe("CaptionManager.convertTextCaptions", () => {
     expect(refs.size).toBe(2);
   });
 });
+
+describe("a paragraph known to be a caption", () => {
+  const WORDING = "montre les terriers des marmottes dans la vallee imaginaire au printemps";
+
+  test("a number and a lowercase wording with no separator read as prose unless told", () => {
+    expect(parseTextCaption(`Figure 77 ${WORDING}`)).toBeNull();
+    const m = parseTextCaption(`Figure 77 ${WORDING}`, { known: true });
+    expect(m?.rawNumber).toBe("77");
+    expect(m?.text).toBe(WORDING);
+  });
+
+  test("a long wording too, and no number still does not make one", () => {
+    const long = `${WORDING} `.repeat(6).trim();
+    expect(parseTextCaption(`Figure 77 ${long}`, { known: true })?.text).toBe(long);
+    expect(parseTextCaption(`Figure ${WORDING}`, { known: true })).toBeNull();
+  });
+
+  test("converting keeps one label: the typed one is replaced", async () => {
+    const e = await docOf([`Figure 77 ${WORDING}`]);
+    const r = await e.captions.convertTextCaptions({ fromIndex: 0, toIndex: 0, kind: "figure", known: true, textSeparator: " : " });
+    expect(r.converted.length).toBe(1);
+    const [only] = await texts(e);
+    expect(only.match(/Figure/g)?.length).toBe(1);
+    expect(only.endsWith(WORDING)).toBe(true);
+  });
+});
+
