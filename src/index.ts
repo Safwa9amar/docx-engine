@@ -357,6 +357,7 @@ export type { TableObject, TableRow, TableCell } from "./core/files/table/types"
 export type { FootnoteEntry } from "./core/PartsManagers/FootnoteManager";
 export type { EndnoteEntry } from "./core/PartsManagers/EndnoteManager";
 export { tcFieldEntries } from "./core/PartsManagers/TableOfContentsManager";
+export { effectiveParagraphLook, type ParagraphLook } from "./core/PartsManagers/mergeStyles";
 export type { TocOptions, TocResult, TocRemoval, TypedTocSpan } from "./core/PartsManagers/TableOfContentsManager";
 export type { BookmarkEntry } from "./core/PartsManagers/CrossReferenceManager";
 export type { CitationSource } from "./core/PartsManagers/CitationManager";

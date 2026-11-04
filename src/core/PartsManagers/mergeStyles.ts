@@ -395,6 +395,110 @@ export function stampNumbering(xml: string, plan: StylePlan): string {
   return out + xml.slice(at);
 }
 
+// ─── What a paragraph's style chain gives it ────────────────────────────────
+
+/** What a paragraph takes from its styles and that a merge can lose: its direction and where its lines stand. */
+export interface ParagraphLook {
+  bidi: boolean;
+  jc?: string;
+  line: string;
+  lineRule: string;
+  before: string;
+  after: string;
+}
+
+const SPACING_ATTRS = ["line", "lineRule", "before", "after"] as const;
+const OFF = /\bw:val="(?:0|false|off)"/;
+
+function applyPPr(look: ParagraphLook, pPr: string): void {
+  const own = pPr.split("<w:pPrChange")[0];
+  const bidi = /<w:bidi\b[^>]*>/.exec(own)?.[0];
+  if (bidi) look.bidi = !OFF.test(bidi);
+  const jc = childVal(own, "w:jc");
+  if (jc) look.jc = jc;
+  const spacing = /<w:spacing\b[^>]*>/.exec(own)?.[0];
+  if (spacing) for (const a of SPACING_ATTRS) {
+    const v = new RegExp(`\\bw:${a}="([^"]*)"`).exec(spacing)?.[1];
+    if (v !== undefined) look[a] = v;
+  }
+}
+
+/** The look of a paragraph of this style, through its `basedOn` chain and the document's defaults. `null`: the default style. */
+export function effectiveParagraphLook(stylesXml: string | null | undefined, styleId: string | null | undefined): ParagraphLook {
+  const look: ParagraphLook = { bidi: false, line: "240", lineRule: "auto", before: "0", after: "0" };
+  const xml = stylesXml ?? "";
+  const defaults = /<w:pPrDefault\b[^>]*>([\s\S]*?)<\/w:pPrDefault>/.exec(xml)?.[1];
+  if (defaults) applyPPr(look, defaults);
+  const styles = readStyles(xml).filter((s) => s.type === "paragraph");
+  const start = styles.find((s) => s.id === styleId) ?? styles.find((s) => s.isDefault);
+  const chain: StyleInfo[] = [];
+  const seen = new Set<string>();
+  for (let at = start; at && !seen.has(at.id); at = styles.find((s) => s.id === at!.basedOn)) {
+    seen.add(at.id);
+    chain.unshift(at);
+  }
+  for (const s of chain) {
+    const pPr = /<w:pPr\b[^>]*>([\s\S]*?)<\/w:pPr>/.exec(s.xml)?.[1];
+    if (pPr) applyPPr(look, pPr);
+  }
+  return look;
+}
+
+/**
+ * Write on every paragraph of a copied block, nested ones included, what its style gave it in the source
+ * and the style it lands on would not. What the paragraph says itself stands. `lookOf` takes the source's
+ * style id, `null` for none, and returns the properties to write, or null when nothing differs.
+ */
+export function stampParagraphLook(xml: string, lookOf: (styleId: string | null) => Partial<ParagraphLook> | null): string {
+  const open = /<w:p(?:\s[^>]*?)?(\/)?>/g;
+  let out = "";
+  let at = 0;
+  for (let m = open.exec(xml); m; m = open.exec(xml)) {
+    const after = m.index + m[0].length;
+    const selfClosed = !!m[1];
+    const hasPPr = !selfClosed && /^\s*<w:pPr[\s/>]/.test(xml.slice(after, after + 12));
+    let innerStart = after;
+    let innerEnd = after;
+    let inner = "";
+    let replaceEnd = after;
+    if (hasPPr) {
+      const pPrOpen = /^\s*<w:pPr(?:\s[^>]*?)?(\/)?>/.exec(xml.slice(after))!;
+      if (pPrOpen[1]) replaceEnd = after + pPrOpen[0].length;
+      else {
+        innerStart = after + pPrOpen[0].length;
+        innerEnd = paragraphPropsEnd(xml, innerStart);
+        if (innerEnd === -1) break;
+        inner = xml.slice(innerStart, innerEnd);
+        replaceEnd = innerEnd + "</w:pPr>".length;
+      }
+    }
+    const own = inner.split("<w:pPrChange")[0];
+    const wanted = lookOf(childVal(own, "w:pStyle") ?? null);
+    if (!wanted) continue;
+    let next = inner;
+    if (wanted.bidi !== undefined && !own.includes("<w:bidi")) next += wanted.bidi ? "<w:bidi/>" : '<w:bidi w:val="0"/>';
+    if (wanted.jc !== undefined && !own.includes("<w:jc")) next += `<w:jc w:val="${wanted.jc}"/>`;
+    const attrs = SPACING_ATTRS.filter((a) => wanted[a] !== undefined);
+    if (attrs.length) {
+      const had = /<w:spacing\b[^>]*?\/?>/.exec(own)?.[0];
+      const missing = attrs.filter((a) => !(had && new RegExp(`\\bw:${a}=`).test(had))).map((a) => ` w:${a}="${wanted[a]}"`).join("");
+      if (had && missing) next = next.replace(had, had.replace(/\s*(\/?)>$/, `${missing}$1>`));
+      else if (!had && missing) next += `<w:spacing${missing}/>`;
+    }
+    if (next === inner) continue;
+    const pPr = `<w:pPr>${canonicalizeParagraphProps(next)}</w:pPr>`;
+    if (selfClosed) {
+      out += xml.slice(at, m.index) + m[0].replace(/\s*\/>$/, ">") + pPr + "</w:p>";
+      at = after;
+    } else {
+      out += xml.slice(at, after) + pPr;
+      at = replaceEnd;
+    }
+    open.lastIndex = Math.max(open.lastIndex, at);
+  }
+  return out + xml.slice(at);
+}
+
 /** Where the `w:pPr` whose content starts at `from` closes; a `w:pPrChange` nests another. */
 function paragraphPropsEnd(xml: string, from: number): number {
   const tag = /<w:pPr(?:\s[^>]*?)?(\/)?>|<\/w:pPr>/g;

@@ -37,7 +37,7 @@ import { NumberingManager, type RawNumbering } from "./NumberingManager";
 import { RelManager } from "./RelManager";
 import { ContentTypesManager } from "./ContentTypesManager";
 import { SettingsManager } from "./SettingsManager";
-import { planStyles, retargetListRefs, retargetStyleRefs, stampNumbering, type StylePlan } from "./mergeStyles";
+import { effectiveParagraphLook, planStyles, retargetListRefs, retargetStyleRefs, stampNumbering, stampParagraphLook, type ParagraphLook, type StylePlan } from "./mergeStyles";
 import { parseXml } from "@/utils/xmlUtils";
 import { carryRootNamespaces } from "@/utils/rootNamespaces";
 import { assembleDocument, splitDocument, type BodyBlock } from "@/core/files/body/OrderedBody";
@@ -675,9 +675,10 @@ export class MergeManager {
     const numberingMap = await this.buildNumberingMap(source, sourceLists, styles);
     await this.importStyles(styles, numberingMap);
     const ids = this.planIds(content);
+    const keepLook = this.lookKeeper(source.zip.readAsText("word/styles.xml"), this.zip.readAsText("word/styles.xml"), styles);
     const prepareNote = (xml: string) =>
       this.applyIdPlan(
-        retargetStyleRefs(this.applyNumIdMap(stampNumbering(stripCommentMarks(unbind(xml), commentIds), styles), numberingMap), styles),
+        retargetStyleRefs(this.applyNumIdMap(stampNumbering(stampParagraphLook(stripCommentMarks(unbind(xml), commentIds), keepLook), styles), numberingMap), styles),
         ids,
       );
     for (const kind of NOTE_KINDS) {
@@ -689,7 +690,7 @@ export class MergeManager {
     const vmlOleMap = await this.buildVmlOleMap(source, srcRels, scan);
 
     return blocks.map((b) => {
-      let xml = stampNumbering(unbind(b.xml), styles);
+      let xml = stampNumbering(stampParagraphLook(unbind(b.xml), keepLook), styles);
       xml = this.applyAttrMap(xml, ["r:embed", "r:link"], mediaMap);
       xml = this.applyOtherRelMap(xml, otherRelMap);
       xml = this.applyHyperlinkMap(xml, hyperlinkMap);
@@ -703,6 +704,32 @@ export class MergeManager {
       xml = this.stripSectionChrome(xml);
       return { kind: b.kind, tag: b.tag, xml };
     });
+  }
+
+  /**
+   * For a source style id: what a paragraph of it takes from its styles in the source and would not from
+   * the style it lands on here. A merge keeps the first part's Normal; a part whose right-to-left came
+   * from its own Normal would otherwise lose it on every paragraph. Read once per style.
+   */
+  private lookKeeper(sourceStyles: string | null, targetStyles: string | null, plan: StylePlan): (styleId: string | null) => Partial<ParagraphLook> | null {
+    const memo = new Map<string, Partial<ParagraphLook> | null>();
+    return (styleId) => {
+      const key = styleId ?? "";
+      if (memo.has(key)) return memo.get(key)!;
+      const was = effectiveParagraphLook(sourceStyles, styleId);
+      const d = styleId ? plan.decisions.get(styleId) : undefined;
+      const landsOn = d && d.kind !== "skip" ? d.id : null;
+      const now = effectiveParagraphLook(targetStyles, landsOn);
+      const diff: Partial<ParagraphLook> = {};
+      if (was.bidi !== now.bidi) diff.bidi = was.bidi;
+      if (was.jc !== now.jc) diff.jc = was.jc ?? "start";
+      for (const a of ["line", "lineRule", "before", "after"] as const) if (was[a] !== now[a]) diff[a] = was[a];
+      // line and lineRule are read together
+      if (diff.line !== undefined || diff.lineRule !== undefined) { diff.line = was.line; diff.lineRule = was.lineRule; }
+      const out = Object.keys(diff).length ? diff : null;
+      memo.set(key, out);
+      return out;
+    };
   }
 
   /**
