@@ -341,6 +341,14 @@ describe("addGeneratedCaption — spaces typed in front of the wording", () => {
     expect(paragraphText((await e.document.getBlocks())[0].xml)).toBe("شكل 1: وصف قصير آخر");
   });
 
+  test("a space further on in the wording stays: only what stands in front of it goes", async () => {
+    const rPr = "<w:rPr><w:rtl/></w:rPr>";
+    const e = await docOf([para(run("mots premiers ( ", rPr) + run("12 )", rPr) + run(" suite ", rPr) + run("fin", rPr))]);
+    const r = await e.captions.addGeneratedCaption(0, { kind: "table", label: "Tableau" });
+    expect(r.ok).toBe(true);
+    expect(paragraphText((await e.document.getBlocks())[0].xml)).toContain("mots premiers ( 12 ) suite fin");
+  });
+
   test("a run of nothing but spaces goes, and the run after it loses its own", async () => {
     const e = await docOf([para(run("   ") + run("  وصف"))]);
     await e.captions.addGeneratedCaption(0, { kind: "figure", label: "شكل", rtl: true, textSeparator: ": " });

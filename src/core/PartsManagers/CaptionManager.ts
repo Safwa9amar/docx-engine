@@ -736,7 +736,7 @@ export function removeLeadingWord(paragraphXml: string, word: string): { xml: st
 }
 
 const LEADING_SPACES_RUN = new RegExp(
-  "^((?:\\s*<w:(?:bookmarkStart|bookmarkEnd|proofErr)\\b[^>]*/>)*\\s*<w:r(?:\\s[^>]*)?>(?:<w:rPr>[\\s\\S]*?</w:rPr>|<w:rPr/>)?)" +
+  "^((?:\\s*<w:(?:bookmarkStart|bookmarkEnd|proofErr)\\b[^>]*/>)*\\s*<w:r(?:\\s[^>]*)?>(?:<w:rPr>(?:(?!</w:rPr>)[\\s\\S])*</w:rPr>|<w:rPr/>)?)" +
   `<w:t((?:\\s[^>]*)?)>(${TYPED_SPACE}+)([^<]*)</w:t>(\\s*</w:r>)`,
 );
 
