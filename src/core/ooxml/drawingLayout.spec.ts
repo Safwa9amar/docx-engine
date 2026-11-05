@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { applyDrawingLayout, readDrawingLayout } from "./drawingLayout";
+import { undeclaredPrefixes } from "./namespaces";
 
 /** A picture in the text flow — what insert/import writes, and what an imported
  *  thesis's بسم الله page holds. */
@@ -202,5 +203,64 @@ describe("applyDrawingLayout — refusals", () => {
       `<wp:docPr id="2" name="Legacy"/><a:graphic/></wp:inline></w:drawing></mc:Fallback>` +
       `</mc:AlternateContent></w:r></w:p>`;
     expect(() => applyDrawingLayout(fallbackOnly, { vertical: "center" })).toThrow(/mc:Fallback/);
+  });
+});
+
+// The picture as `addImage` writes it: the wp and a prefixes are declared on the
+// drawing's OWN tag, not on a root above it. A block fragment carries nothing
+// else, so a container that loses those declarations leaves its a:graphic
+// pointing at a prefix nothing declares, and Word refuses the file.
+const W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+const R_NS = 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"';
+const WP_NS = 'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"';
+const A_NS = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"';
+const PIC_NS = 'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"';
+const SELF_DECLARED =
+  `<w:p ${W_NS} ${R_NS}><w:r><w:drawing>` +
+  `<wp:inline ${WP_NS} ${A_NS} ${PIC_NS} distT="0" distB="0" distL="0" distR="0">` +
+  `<wp:extent cx="4572000" cy="1600200"/>` +
+  `<wp:effectExtent l="0" t="0" r="0" b="0"/>` +
+  `<wp:docPr id="1" name="Picture 1"/>` +
+  `<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>` +
+  `<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
+  `<pic:pic><pic:blipFill><a:blip r:embed="rId7"/></pic:blipFill></pic:pic>` +
+  `</a:graphicData></a:graphic>` +
+  `</wp:inline></w:drawing></w:r></w:p>`;
+
+describe("applyDrawingLayout — the namespaces a picture declares on its own tag", () => {
+  it("the fixture is clean before any change", () => {
+    expect(undeclaredPrefixes(SELF_DECLARED)).toEqual([]);
+  });
+
+  it("floating it keeps every prefix it uses declared", () => {
+    const r = applyDrawingLayout(SELF_DECLARED, { horizontal: "center", vertical: "center" });
+    expect(r.changed).toBe(true);
+    expect(undeclaredPrefixes(r.xml)).toEqual([]);
+  });
+
+  it("carries the declarations onto the wp:anchor that replaces the wp:inline", () => {
+    const r = applyDrawingLayout(SELF_DECLARED, { vertical: "center" });
+    const open = /<wp:anchor\b[^>]*>/.exec(r.xml)![0];
+    expect(open).toContain(A_NS);
+    expect(open).toContain(WP_NS);
+    expect(open).toContain(PIC_NS);
+    // Each declaration appears once: a repeated attribute is not well-formed.
+    expect(open.match(/xmlns:a=/g)).toHaveLength(1);
+  });
+
+  it("returning it to the flow keeps every prefix declared, and nothing is declared twice", () => {
+    const floated = applyDrawingLayout(SELF_DECLARED, { horizontal: "center", vertical: "center" }).xml;
+    const back = applyDrawingLayout(floated, { float: false });
+    expect(back.changed).toBe(true);
+    expect(undeclaredPrefixes(back.xml)).toEqual([]);
+    const open = /<wp:inline\b[^>]*>/.exec(back.xml)![0];
+    expect(open.match(/xmlns:a=/g)).toHaveLength(1);
+  });
+
+  it("moving an already-floating picture does not repeat its declarations", () => {
+    const floated = applyDrawingLayout(SELF_DECLARED, { vertical: "center" }).xml;
+    const moved = applyDrawingLayout(floated, { vertical: "bottom" });
+    expect(undeclaredPrefixes(moved.xml)).toEqual([]);
+    expect(/<wp:anchor\b[^>]*>/.exec(moved.xml)![0].match(/xmlns:a=/g)).toHaveLength(1);
   });
 });

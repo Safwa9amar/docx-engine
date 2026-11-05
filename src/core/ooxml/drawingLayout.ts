@@ -151,6 +151,24 @@ function openAttrs(open: string): string {
   return /^<wp:(?:inline|anchor)((?:\s[^>]*?)?)>$/.exec(open)?.[1] ?? "";
 }
 
+/** A namespace declaration on a tag: `xmlns:x="…"` or the default `xmlns="…"`, leading space included. */
+const NS_DECL_RE = /\sxmlns(?::[\w.-]+)?="[^"]*"/g;
+
+/**
+ * The namespace declarations on the container's own opening tag. `addImage` writes
+ * `xmlns:wp` and `xmlns:a` there, not on a root above, and the `a:graphic` that
+ * is copied through still uses `a:`: a container rebuilt without them leaves a
+ * prefix nothing declares, which Word refuses to open.
+ */
+function namespaceDeclarations(open: string): string {
+  return open.match(NS_DECL_RE)?.join("") ?? "";
+}
+
+/** The opening tag's attributes with its namespace declarations taken out, so they are written once. */
+function withoutNamespaceDeclarations(attrs: string): string {
+  return attrs.replace(NS_DECL_RE, "");
+}
+
 /** The part of a container's inner XML that holds its geometry — everything
  *  before `<a:graphic`, which is where a nested drawing could start. */
 function geometryPrefix(inner: string): { geo: string; rest: string } {
@@ -305,7 +323,7 @@ export function applyDrawingLayout(xml: string, opts: DrawingLayout): DrawingLay
     const inner = stripAnchorGeometry(geo) + rest;
     const next =
       xml.slice(0, span.start) +
-      `<wp:inline distT="0" distB="0" distL="0" distR="0">${inner}</wp:inline>` +
+      `<wp:inline distT="0" distB="0" distL="0" distR="0"${namespaceDeclarations(span.open)}>${inner}</wp:inline>` +
       xml.slice(span.end);
     return { xml: next, changed: true, placement: readDrawingLayout(next)!, legacyTwin };
   }
@@ -343,11 +361,13 @@ export function applyDrawingLayout(xml: string, opts: DrawingLayout): DrawingLay
   // picture gets Word's defaults.
   const attrs =
     span.kind === "anchor"
-      ? openAttrs(span.open).trim() || ANCHOR_ATTRS
+      ? withoutNamespaceDeclarations(openAttrs(span.open)).trim() || ANCHOR_ATTRS
       : ANCHOR_ATTRS;
+  // The declarations travel with the container (written once, after the attributes): anything in scope at
+  // the old position is still in scope at the new one, so the copied a:graphic keeps resolving its prefixes.
   const next =
     xml.slice(0, span.start) +
-    `<wp:anchor ${attrs}>${nextGeo}${rest}</wp:anchor>` +
+    `<wp:anchor ${attrs}${namespaceDeclarations(span.open)}>${nextGeo}${rest}</wp:anchor>` +
     xml.slice(span.end);
   return { xml: next, changed: next !== xml, placement: readDrawingLayout(next)!, legacyTwin };
 }
