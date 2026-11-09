@@ -7,9 +7,39 @@ export declare interface AppendOptions {
     leadingBlocks?: BodyBlock[];
     /** source styleId → target styleId (applied to `<w:pStyle w:val>`). */
     styleMap?: Record<string, string>;
+    /**
+     * Each part's text stays on its own page: a seam of section properties where the source's page or
+     * section breaks need one. Left off, as the combine flow does, the target's template owns the pages.
+     */
+    keepPages?: boolean;
+}
+
+/** Appends a Relationship with the next free rIdN. */
+export declare function appendRel(relsXml: string, type: string, target: string): {
+    xml: string;
+    id: string;
+};
+
+export declare interface AppendResult {
+    /** Comments the source carried, none of which came across. */
+    commentsStripped: number;
+    /** Where the source's note properties gave way to this document's. */
+    noteConflicts: NoteConflict[];
+    /** Content controls of the source that lost their tie to a store left behind, keeping their words. */
+    bindingsDropped: number;
 }
 
 export declare function applyBodyPageLayout(documentXml: string, opts: BodyPageLayoutOpts): string;
+
+/**
+ * Pure transform: write document defaults into `<w:docDefaults>` (created as the
+ * first child of `<w:styles>` when absent), creating `rPrDefault` / `pPrDefault`
+ * as needed. Only the named properties change.
+ */
+export declare function applyDocDefaultsToXml(stylesXml: string, d: DocDefaultsInput): {
+    xml: string;
+    updated: boolean;
+};
 
 /**
  * Place the first picture in a paragraph, converting its container as needed.
@@ -50,6 +80,15 @@ export declare function applyBodyPageLayout(documentXml: string, opts: BodyPageL
 export declare function applyDrawingLayout(xml: string, opts: DrawingLayout): DrawingLayoutResult;
 
 /**
+ * Pure transform: add a minimal style when `styleId` is missing. An existing
+ * style is NEVER modified (not even to make it match `spec`).
+ */
+export declare function applyEnsureStyleToXml(stylesXml: string, styleId: string, spec: EnsureStyleOptions): {
+    xml: string;
+    created: boolean;
+};
+
+/**
  * Apply pagination toggles to one paragraph's XML.
  *
  * `true` writes the bare element (`<w:keepNext/>`); `false` writes an EXPLICIT
@@ -78,6 +117,31 @@ export declare function applyParagraphPagination(xml: string, opts: ParagraphPag
  * invalid size or colour (see `runProps.mergeRunProps`).
  */
 export declare function applyRunPropsToParagraph(xml: string, props: RunProps): ParagraphRunStyleResult;
+
+/**
+ * Pure transform. `attrs === null` removes the element; an object writes
+ * `<w:name a="b"/>` (keys without a prefix get `w:`). An existing element is
+ * replaced IN PLACE, a new one goes before the first later-in-sequence sibling
+ * present (else before `</w:settings>`).
+ *
+ * @throws on a name that is not a `CT_Settings` child, and on a part with no
+ * `<w:settings>` root.
+ */
+export declare function applySettingToXml(settingsXml: string, name: string, attrs: Record<string, string> | null): {
+    xml: string;
+    changed: boolean;
+};
+
+/**
+ * Pure transform: apply paragraph `props` to the `<w:pPr>` of `styleId`, creating
+ * the style first when `ensure` is supplied and it is missing. String surgery
+ * only — every byte outside the one style's `pPr` is untouched.
+ */
+export declare function applyStyleParagraphPropsToXml(stylesXml: string, styleId: string, props: ParaStyleProps, ensure?: EnsureStyleSpec): {
+    xml: string;
+    created: boolean;
+    updated: boolean;
+};
 
 /**
  * Pure transform: apply `props` to the `<w:rPr>` of the `styleId` style inside a
@@ -178,6 +242,16 @@ export declare function buildParagraphStyleXml(styleId: string, name: string, op
     isDefault?: boolean;
 }): string;
 
+/** We only embed fonts the student may keep editing with. */
+export declare function canEmbed(p: EmbeddingPermission): boolean;
+
+/**
+ * Put this package in the usual shape, in place. Returns how many entries moved, 0 when it already was.
+ * Throws, with nothing written, when the main part cannot be found or something else in the package
+ * relies on the part that stands where it has to go.
+ */
+export declare function canonicalizeMainPart(zip: default_2): number;
+
 /**
  * Sort the INNER XML of a `<w:pPr>` into `CT_PPr` order.
  *
@@ -186,6 +260,9 @@ export declare function buildParagraphStyleXml(styleId: string, name: string, op
  * paragraph rather than letting one bad paragraph abort the document.
  */
 export declare const canonicalizeParagraphProps: (pPrInner: string) => string;
+
+/** The same, on the bytes. A package already in the usual shape comes back as the same bytes. */
+export declare function canonicalMainPart(docx: Buffer): Buffer;
 
 export declare interface CaptionEntry {
     /** The SEQ identifier the caption is numbered under (e.g. "Figure"). */
@@ -313,6 +390,46 @@ export declare class CaptionManager {
      * ones use most often.
      */
     convertTextCaptions(opts?: ConvertTextCaptionsOptions): Promise<ConvertTextCaptionsResult>;
+    /**
+     * Give an UNNUMBERED caption a real label and number, leaving the student's
+     * own words alone.
+     *
+     * A student who typed just "البيان المالي" under a table has a caption in
+     * everything but name. This writes `label + SEQ field + separator` in FRONT of
+     * their runs and switches the style to Caption — the label and number are
+     * generated apparatus, like a page number. Unlike {@link convertTextCaptions}
+     * it never rebuilds the runs from text: footnote references, hyperlinks,
+     * fields, bookmarks and run formatting stay byte-identical and in order.
+     *
+     * Refuses, changing nothing, when the block is not a paragraph, already is a
+     * real caption, is a heading, has no text, or carries a picture (the label
+     * would land in front of the image, not the wording).
+     */
+    addGeneratedCaption(blockIndex: number, opts: {
+        kind: CaptionKind;
+        label?: string;
+        rtl?: boolean;
+        textSeparator?: string;
+        numbering?: CaptionNumberingOptions;
+        /**
+         * The label WORD the student may have typed in front of their wording ("جدول"
+         * in "جدول الميزانية"). When the paragraph starts with exactly that word, as a
+         * whole word wholly inside its first text run, the word and the whitespace after
+         * it are cut and the generated label takes its place: "جدول 1: الميزانية", not
+         * "جدول 1: جدول الميزانية". When it cannot be cut cleanly (split across runs, not
+         * at the start, standing alone, behind a field or a hyperlink) nothing is touched
+         * and `droppedWord` is false. Only that first run changes; see {@link removeLeadingWord}.
+         */
+        dropLeadingWord?: string;
+    }): Promise<{
+        ok: true;
+        label: string;
+        number: string;
+        droppedWord: boolean;
+    } | {
+        ok: false;
+        reason: GeneratedCaptionRefusal;
+    }>;
     /**
      * The label each converted kind will carry. Existing REAL captions win — an
      * Arabic thesis whose figures already say "الشكل رقم" must not gain a second
@@ -455,7 +572,7 @@ declare type ChapterSeparator_2 = "hyphen" | "period" | "colon" | "emDash" | "en
 
 declare type ChapterSeparator_3 = "hyphen" | "period" | "colon" | "emDash" | "enDash";
 
-/** Check a .docx held as bytes. Read-only — the buffer is never modified. */
+/** Check a .docx held as bytes. Read-only: the buffer is never modified. */
 export declare function checkDocxBuffer(buffer: Buffer): Promise<DoctorReport>;
 
 /** A picture placed in a header/footer part, with the geometry needed to paint
@@ -567,19 +684,21 @@ export declare interface CitationSource {
  *
  * LibreOffice (and anything else that streams a zip) sets general-purpose bit 3
  * and appends a descriptor after each entry. adm-zip re-writes such an archive
- * with real sizes and CRCs in the headers but WITHOUT the descriptor — while
- * faithfully copying the flag that promises one. The result is a perfectly valid
- * zip by every other reader (`unzip -t` passes, Word opens it) that adm-zip's own
- * reader then refuses with "No descriptor present".
+ * with real sizes and CRCs in the headers but WITHOUT the descriptor, while
+ * faithfully copying the flag that promises one. `unzip -t` still passes, but
+ * real Word refuses the file (-10000, even with one such entry; measured on Word
+ * for Mac), and adm-zip's own reader throws "No descriptor present".
  *
  * That matters here because the server re-opens its own output on the next edit:
  * one save of a LibreOffice-authored upload was enough to make every later AI
  * edit of that thesis fail to load. Clearing the lying flag is a two-byte fix per
  * entry, and it makes the bytes describe what is actually in the file.
  *
- * Bails out untouched on anything unexpected (Zip64, truncated directory, a
- * local header that doesn't line up) — a half-rewritten zip is far worse than an
- * unhelpful one.
+ * Each entry is judged on its own evidence: is there a descriptor behind its
+ * data? So a truly streamed archive comes back as the same buffer, and so does
+ * anything `readZipEntries` won't vouch for. A CRC of 0 proves nothing either
+ * way: directories and empty files carry one legitimately, and they lose a false
+ * flag like any other entry. Never mutates its input.
  */
 export declare function clearFalseDataDescriptors(buffer: Buffer): Buffer;
 
@@ -672,6 +791,10 @@ export declare interface ConvertedCaption {
     before: string;
     /** Its text after — the same wording, now with a live number. */
     after: string;
+    /** The number the student had typed ("" if none); the live field replaces it. */
+    typedNumber: string;
+    /** The live number now shown by the field. */
+    number: string;
 }
 
 export declare interface ConvertTextCaptionsOptions {
@@ -683,6 +806,8 @@ export declare interface ConvertTextCaptionsOptions {
     kind?: CaptionKind | "all";
     /** Force the label to write, e.g. "Tableau". Only honoured for a single `kind`. */
     label?: string;
+    /** The caller knows these paragraphs are captions: see parseTextCaption. */
+    known?: boolean;
     /**
      * Numbering, as in Word's dialog. Omit for plain sequential numbers
      * ("Figure 1", "Figure 2", …); set `includeChapterNumber` for per-chapter
@@ -691,6 +816,14 @@ export declare interface ConvertTextCaptionsOptions {
     numbering?: CaptionNumberingOptions;
     /** Force RTL/LTR; omit to follow each paragraph's own direction. */
     rtl?: boolean;
+    /**
+     * What to write between the number and the wording of EVERY converted caption
+     * (": ", " : "). Omit it and each caption keeps the punctuation its author
+     * typed, which is the right default for a tool editing one caption; a caller
+     * that rebuilds a whole thesis passes it so the list of tables does not show
+     * "Tableau 1 : …" beside "Tableau 2 - …".
+     */
+    textSeparator?: string;
     /** Report what WOULD convert without writing anything. */
     dryRun?: boolean;
 }
@@ -755,6 +888,12 @@ export declare class CrossReferenceManager {
  * Mirrors the `CT_PPR` table the document doctor validates against (src/doctor).
  */
 export declare const CT_PPR_ORDER: readonly string[];
+
+/** `CT_Settings` child sequence, ECMA-376 Part 1 17.15.1.78 (without the `w:` prefix). */
+export declare const CT_SETTINGS_ORDER: readonly string[];
+
+/** Declare on the root every undeclared prefix this module knows. An unknown one stays for the doctor. */
+export declare function declareUsedPrefixes(xml: string): string;
 
 /**
  * Common French/English Word heading + body style aliases → canonical target
@@ -1048,6 +1187,11 @@ export declare class Doc {
         changed: boolean;
     }>;
     /**
+     * Set the page size / margins of the section CONTAINING the block at
+     * `blockIndex` (byte-safe; only the named attributes change).
+     */
+    setSectionGeometry(blockIndex: number, geometry: SectPrGeometry): Promise<SectionEditResult>;
+    /**
      * Give the section CONTAINING the block at `blockIndex` its own running header
      * (call `startOnNewPage` on that heading first to make it its own section).
      * Empty text → a blank header for that section. Cleans up the section's
@@ -1163,6 +1307,20 @@ export declare class Doc {
     save(outputPath: string): Promise<void>;
     /** Get the document as an in-memory buffer. */
     toBuffer(): Buffer;
+}
+
+export declare interface DocDefaultsInput {
+    fontLatin?: string;
+    fontCs?: string;
+    sizePt?: number;
+    sizeCsPt?: number;
+    lang?: {
+        val?: string;
+        bidi?: string;
+    };
+    /** Multiple of single line spacing. */
+    lineSpacing?: number;
+    afterPt?: number;
 }
 
 /** A generated, always-accurate structural map of the document. */
@@ -1471,6 +1629,30 @@ export declare function eachParagraphIn(xml: string): Array<{
     xml: string;
 }>;
 
+/** The look of a paragraph of this style, through its `basedOn` chain and the document's defaults. `null`: the default style. */
+export declare function effectiveParagraphLook(stylesXml: string | null | undefined, styleId: string | null | undefined): ParagraphLook;
+
+export declare type EmbeddingPermission = "installable" | "editable" | "preview-print" | "restricted" | "unknown";
+
+/** Bits 1–3 are the usage permissions; when several are set the least restrictive applies. */
+export declare function embeddingPermission(fsType: number | null): EmbeddingPermission;
+
+export declare interface EmbedFontInput {
+    name: string;
+    regular: Buffer;
+    bold?: Buffer;
+    italic?: Buffer;
+    boldItalic?: Buffer;
+}
+
+export declare interface EmbedFontResult {
+    name: string;
+    embedded: boolean;
+    reason?: EmbeddingPermission;
+    variants: FontVariant[];
+    settingsUpdated: boolean;
+}
+
 export declare const EMU_PER_CM = 360000;
 
 export declare const EMU_PER_INCH = 914400;
@@ -1496,7 +1678,7 @@ export declare class EndnoteManager {
     private emptyEndnotesDoc;
     private normalizeArray;
     private nextId;
-    private ensureRegistered;
+    ensureRegistered(): Promise<void>;
     /**
      * Returns all user-defined endnotes (excludes separator entries).
      */
@@ -1511,6 +1693,16 @@ export declare class EndnoteManager {
         run: Run_2;
     }>;
     /**
+     * Copy endnote ELEMENTS verbatim from another document's endnotes.xml string,
+     * preserving their rich content (runs, rPr, hyperlinks). Each needed endnote is
+     * appended under a fresh, collision-free id; returns source-id → new-id.
+     *
+     * Byte-faithful string injection, the same as
+     * `FootnoteManager.copyFootnotesVerbatim`: `rewrite` is where the caller fixes
+     * what a note references (relationships, numbering).
+     */
+    copyEndnotesVerbatim(sourceEndnotesXml: string | null, neededIds: Set<string>, rewrite?: (endnoteXml: string) => Promise<string>): Promise<Record<string, string>>;
+    /**
      * Removes an endnote by id.
      */
     removeEndnote(id: number): Promise<void>;
@@ -1519,6 +1711,16 @@ export declare class EndnoteManager {
      */
     createEndnoteRun(endnoteId: number): Run_2;
     private extractText;
+}
+
+/** How `ensureStyle` creates a style that is missing. */
+export declare interface EnsureStyleOptions {
+    name: string;
+    type: "paragraph" | "character";
+    basedOn?: string;
+    next?: string;
+    uiPriority?: number;
+    qFormat?: boolean;
 }
 
 /** How to create a paragraph style that does not exist yet. */
@@ -1588,6 +1790,27 @@ export declare interface Finding {
 /** A cheap well-formedness check: tag balance with quote/comment awareness.
  *  Not a validator — its job is to catch a part we (or a previous writer) tore. */
 export declare function firstXmlError(xml: string): string | null;
+
+export declare function fontKeyBytes(guid: string): Buffer;
+
+export declare class FontTableManager {
+    private zip;
+    private contentTypes;
+    /** Replaceable in tests so font keys are deterministic. */
+    newKey: () => string;
+    constructor(zip: ZipManager, contentTypes: ContentTypesManager);
+    /** A part's text, or "" when the part does not exist. */
+    private read;
+    /** Every w:font name in fontTable.xml, in document order. */
+    listFonts(): string[];
+    /** Names of fonts that carry at least one embedded variant. */
+    embeddedFonts(): string[];
+    embedFont(input: EmbedFontInput): Promise<EmbedFontResult>;
+    /** The settings.xml text with w:embedTrueTypeFonts switched on (null = leave untouched). */
+    private resolveSettings;
+}
+
+export declare type FontVariant = "regular" | "bold" | "italic" | "boldItalic";
 
 export declare class FooterManager {
     zip: default_2;
@@ -1691,7 +1914,7 @@ export declare class FootnoteManager {
     private emptyFootnotesDoc;
     private normalizeArray;
     private nextId;
-    private ensureRegistered;
+    ensureRegistered(): Promise<void>;
     /**
      * Returns all user-defined footnotes (excludes separator entries).
      */
@@ -1716,7 +1939,7 @@ export declare class FootnoteManager {
      * never be mis-nested. NOTE: footnote-internal media (r:embed) / numbering are
      * NOT remapped here — footnotes embedding images are a rare deferred edge.
      */
-    copyFootnotesVerbatim(sourceFootnotesXml: string | null, neededIds: Set<string>): Promise<Record<string, string>>;
+    copyFootnotesVerbatim(sourceFootnotesXml: string | null, neededIds: Set<string>, rewrite?: (footnoteXml: string) => Promise<string>): Promise<Record<string, string>>;
     /**
      * Removes a footnote by id from footnotes.xml.
      * You must also manually remove the <w:footnoteReference> run from the document.
@@ -1796,6 +2019,9 @@ export declare interface FrontMatterNumberingOptions {
     /** Page number the body restarts at (default 1). */
     bodyStartAt?: number;
 }
+
+/** Why {@link CaptionManager.addGeneratedCaption} left a block alone. */
+export declare type GeneratedCaptionRefusal = "no-such-block" | "not-a-paragraph" | "already-a-caption" | "is-a-heading" | "empty-text" | "contains-image";
 
 export declare class HeaderManager {
     zip: default_2;
@@ -2048,6 +2274,13 @@ export declare interface InspectOptions {
 }
 
 /**
+ * Read a package's zip flags without touching it. Null when the zip can't be
+ * walked (see `readZipEntries`). `clearFalseDataDescriptors` clears exactly the
+ * two descriptor lists, so what this names is what a repair clears.
+ */
+export declare function inspectZipFlags(buffer: Buffer): ZipFlagReport | null;
+
+/**
  * Whether a body child counts as an indexable block.
  *
  * Excludes the trailing w:sectPr AND whitespace-only #text runs (left behind by
@@ -2061,8 +2294,17 @@ export declare interface InspectOptions {
  */
 export declare function isEditableBlock(b: BodyBlock): boolean;
 
+/** Whether a prefix can be repaired by `declareUsedPrefixes`. */
+export declare const isKnownPrefix: (prefix: string) => boolean;
+
 /** True when `xml` is a `<w:p>` element this module can rewrite. */
 export declare function isParagraphXml(xml: string): boolean;
+
+/** Whether a word at the head of a field code is the field's type, and not a bookmark's name. */
+export declare const isWordFieldType: (word: string) => boolean;
+
+/** Run properties that carry meaning rather than look. Without the `w:` prefix. */
+export declare const KEPT_RUN_PROPS: readonly string[];
 
 export declare interface LineNumberingOptions {
     countBy?: number;
@@ -2070,6 +2312,9 @@ export declare interface LineNumberingOptions {
     distance?: number;
     restart?: "newPage" | "newSection" | "continuous";
 }
+
+/** The entry `_rels/.rels` calls the officeDocument. Throws when there is not exactly one. */
+export declare function mainPartOf(zip: default_2): string;
 
 /** Build a drawing (inline image) paragraph `BodyBlock`. */
 export declare function makeDrawingParagraphNode(relId: string, widthEmu: number, heightEmu: number, shapeId: number, name: string): BodyBlock;
@@ -2213,9 +2458,11 @@ export declare class Mdocxengine {
     comments: CommentsManager;
     trackedChanges: TrackedChangesManager;
     sections: SectionManager;
+    settings: SettingsManager;
     shapes: ShapeManager;
     merge: MergeManager;
     formatting: FormattingManager;
+    fontTable: FontTableManager;
     private constructor();
     static loadFromFile(path: string): Promise<Mdocxengine>;
     static loadFromBuffer(buffer: Buffer): Promise<Mdocxengine>;
@@ -2299,6 +2546,13 @@ export declare class MediaManager {
      */
     extractInlineImage(blockXml: string): Promise<InlineImage | null>;
     /**
+     * Next free `imageN` number, counted over EVERY file in word/media. `listImages`
+     * only sees raster/svg extensions, so counting through it ignored `.wmf`/`.emf`
+     * (and `.tif`): with only those present — or a mix — the counter did not advance
+     * and each new image overwrote the last one.
+     */
+    private nextImageNumber;
+    /**
      * Inserts a new image into the document.
      * @param imageBuffer  Raw image bytes.
      * @param extension    File extension without dot (e.g. "png", "jpg").
@@ -2345,20 +2599,52 @@ export declare class MergeManager {
     private document;
     private media;
     private footnotes;
+    private endnotes;
     private numbering;
     private rels;
     private contentTypes;
+    private settings;
     constructor(zip: default_2);
     /**
      * Copy `sourceBuffer`'s body into this document, fully remapped, appended after
      * the existing body (before the trailing sectPr, handled by saveBlocks).
+     * The source's comments do not come across; the result counts them. Comments
+     * already in THIS document are left alone: see `stripComments`.
      */
-    appendDocument(sourceBuffer: Buffer, opts?: AppendOptions): Promise<void>;
+    appendDocument(sourceBuffer: Buffer, opts?: AppendOptions): Promise<AppendResult>;
+    /** The empty paragraphs Word itself keeps between two tables and after a last one. */
+    private keepStoryShape;
+    /** The same for this document as it stands, for one that gets nothing appended. Returns how many went in. */
+    settleStoryShape(): Promise<number>;
+    /**
+     * Remove every comment from THIS document and return how many it had: the
+     * anchors in the body and the notes, the comment parts with their relationships
+     * and content types, and any picture only a comment used. Everything else keeps
+     * its exact bytes; a document with no comments is not rewritten at all.
+     */
+    stripComments(): Promise<number>;
+    /** Delete the comment parts and everything that names them, by string surgery. */
+    private removeCommentParts;
+    /** The package paths a rels part points at, external targets excepted. */
+    private internalTargets;
+    /**
+     * The copied blocks/footnotes/numbering use prefixes (`w14`, `mc`, `wps`, `r`…)
+     * the SOURCE root declared. Bind them on the matching TARGET root, or the part
+     * has unbound prefixes and Word refuses to open it. A prefix bound to a
+     * different URI is a real conflict: throw rather than silently mis-bind.
+     */
+    private carryNamespaces;
     /**
      * Build the id maps from a READ-ONLY concatenation of source blocks, then apply
      * them to EACH block's xml independently (kind/tag preserved verbatim).
      */
     private remapBlocks;
+    /**
+     * For a source style id: what a paragraph of it takes from its styles in the source and would not from
+     * the style it lands on here. A merge keeps the first part's Normal; a part whose right-to-left came
+     * from its own Normal would otherwise lose it on every paragraph. Read once per style.
+     */
+    private lookKeeper;
     /**
      * Drop the source's `headerReference` / `footerReference` from any `sectPr`
      * that rides along with a copied paragraph.
@@ -2371,19 +2657,49 @@ export declare class MergeManager {
      * missing parts). Removing them lets the section inherit the target's chrome,
      * which is the behaviour the combine flow wants anyway.
      *
+     * A section's printer settings go with them: a relationship to a binary this merge
+     * does not copy, and of no use to a deposit.
+     *
      * Everything else in the copied `sectPr` — page size, margins, break type — is
      * preserved.
      */
     private stripSectionChrome;
     /** Read the source document's relationships as { rId: { type, target, targetMode } }. */
     private readSourceRels;
-    /** Copy each image referenced by the blocks; return source-rId → new-rId. */
+    /**
+     * What copies one source relationship here, once each: an external target stays external,
+     * a picture gets its own media part, and any other part comes with its closure, keeping its
+     * relationship type. Undefined when the source itself has nothing behind the id.
+     */
+    private relationshipCarrier;
+    /** Copy what each `r:embed`/`r:link` in the blocks reaches; return source-rId → new-rId. */
     private buildMediaMap;
+    /** Copy what every other relationship reference in the blocks reaches: a link on a picture,
+     *  SmartArt's four parts, an embedded chunk, ink. The elements in REL_OWN_PATH are handled by
+     *  their own paths or removed. */
+    private buildOtherRelMap;
+    private applyOtherRelMap;
     /**
      * Copy external hyperlink relationships referenced by `<w:hyperlink r:id>` into
      * the target (preserving TargetMode="External"); return source-rId → new-rId.
      */
     private buildHyperlinkMap;
+    /** Attributes on `<v:imagedata>` / `<v:fill>` (picture fill) that name a relationship. */
+    private static readonly VML_REL_ATTRS;
+    /** Copy each VML image and OLE object referenced by the blocks; return
+     *  source-rId → new-rId. */
+    private buildVmlOleMap;
+    /** Remap the relationship attributes inside `<v:imagedata>` / `<o:OLEObject>`
+     *  open tags only (never another element's r:id). */
+    private applyVmlOleMap;
+    private importStyles;
+    /** This document's styles part. One with none gets an empty one, without defaults, so that
+     *  its own text keeps rendering as it did. */
+    private stylesPartForImport;
+    private planIds;
+    private applyIdPlan;
+    /** Point the fields and every `w:anchor` naming a renamed bookmark at its new name. */
+    private renameBookmarkRefs;
     /** Copy each chart referenced by the blocks, with its whole part closure;
      *  return source-rId → new-rId. */
     private buildChartMap;
@@ -2405,25 +2721,38 @@ export declare class MergeManager {
     private readContentTypeOverrides;
     /** extension (lower-case, no dot) → content type. */
     private readContentTypeDefaults;
-    /** Copy each referenced source footnote verbatim; return source-id → new-id. */
-    private buildFootnoteMap;
     /**
-     * Copy the source's numbering definitions referenced by the blocks (abstractNum
-     * + num) into the target with fresh, collision-free ids; return source-numId →
-     * new-numId. Without this, two parts that both use `numId="1"` would share one
-     * list and renumber wrongly.
+     * The source notes `blocksXml` refers to, as XML. A reference whose note does not
+     * exist THROWS: Word refuses such a file, and left in place the id could land on
+     * a different note this document already has, which nothing downstream would see.
+     */
+    private neededNotesXml;
+    /** Copy each referenced source note verbatim; return source-id → new-id. `prepare`
+     *  runs on each note before its relationships are remapped. */
+    private buildNoteMap;
+    private settleNoteFurniture;
+    /** The source's separators in place of this document's unused ones. False: it has none, or an
+     *  unreferenced note here already holds one of their ids. */
+    private adoptSeparators;
+    /** Put a note property element in this document's final section, at its schema position. */
+    private setFinalSectionNotePr;
+    /**
+     * Copy the source's lists something copied uses (abstractNum + num) into the target
+     * with fresh, collision-free ids; return source-numId → new-numId. Without this, two
+     * parts that both use `numId="1"` would share one list and renumber wrongly.
      */
     private buildNumberingMap;
+    private highestNumIdInUse;
+    /** A picture bullet's image is reached through the numbering part's own relationships. */
+    private rehomeNumberingRels;
     /** Remap w:val inside <w:numId .../> elements only. */
     private applyNumIdMap;
     /** Replace attr="old" → attr="new" for each given attribute name. */
     private applyAttrMap;
     /** Remap r:id ONLY inside <w:hyperlink ...> open tags (never other r:id). */
     private applyHyperlinkMap;
-    /** Remap w:id ONLY inside <w:footnoteReference .../> (never other w:id). */
-    private applyFootnoteRefMap;
-    /** Retarget <w:pStyle w:val="X"/> by name. */
-    private applyStyleMap;
+    /** Remap w:id ONLY inside <w:footnoteReference/> or <w:endnoteReference/> (never other w:id). */
+    private applyNoteRefMap;
 }
 
 /**
@@ -2458,6 +2787,8 @@ export declare class MetadataManager {
 /** Word's own floor: one half-point. */
 export declare const MIN_FONT_SIZE_PT = 0.5;
 
+export declare function newFontKey(random?: () => Buffer): string;
+
 /**
  * Scan a full `document.xml` for the highest existing drawing id (`wp:docPr @id`
  * and `pic:cNvPr @id`) and return max+1 (minimum 1). Use it to assign a
@@ -2467,6 +2798,16 @@ export declare function nextDrawingId(documentXml: string): number;
 
 /** The tag name of a block (compat shim — accepts a BodyBlock). */
 export declare function nodeTag(block: BodyBlock | string): string;
+
+/** A later part wanted its notes numbered or placed otherwise. One final section, one answer. */
+export declare interface NoteConflict {
+    kind: NoteKind;
+    property: string;
+    kept: string;
+    dropped: string;
+}
+
+declare type NoteKind = "footnote" | "endnote";
 
 export declare interface NumberingDefinition {
     abstractNumId: string;
@@ -2499,19 +2840,24 @@ export declare class NumberingManager {
      * @param abstractNumId The abstractNumId to reference.
      */
     addNumberingDefinition(numId: string, abstractNumId: string): Promise<void>;
-    /** Raw `<w:abstractNum>` + `<w:num>` arrays from this document's numbering.xml. */
+    /** Raw `<w:numPicBullet>`, `<w:abstractNum>` + `<w:num>` arrays from this document's numbering.xml. */
     getRawDefinitions(): Promise<RawNumbering>;
-    /** Highest existing abstractNumId / numId (for collision-free allocation). */
+    /** Highest existing id of each kind (for collision-free allocation). */
     maxIds(): Promise<{
         absMax: number;
         numMax: number;
+        picMax: number;
     }>;
     /**
-     * Append already-id-rewritten `<w:abstractNum>` + `<w:num>` nodes. Keeps the
-     * schema order (all abstractNum before all num) because they are separate keys.
+     * Append already-id-rewritten nodes. `CT_Numbering` is a sequence (picture bullets,
+     * abstractNum, num, the rest), and the builder writes keys in insertion order, so the
+     * root is rebuilt in that order: a key added last would land after `w:num`.
      */
-    appendRawDefinitions(abstractNums: any[], nums: any[]): Promise<void>;
+    appendRawDefinitions(abstractNums: any[], nums: any[], picBullets?: any[]): Promise<void>;
 }
+
+/** Returns a new buffer; XOR makes the same call de-obfuscate. */
+export declare function obfuscateFont(font: Buffer, guid: string): Buffer;
 
 /**
  * Run properties as OBSERVED in a document — the read counterpart of
@@ -2967,6 +3313,16 @@ export declare function paragraphHeadingLevel(xml: string): number;
  */
 export declare function paragraphIsBold(xml: string): boolean;
 
+/** What a paragraph takes from its styles and that a merge can lose: its direction and where its lines stand. */
+export declare interface ParagraphLook {
+    bidi: boolean;
+    jc?: string;
+    line: string;
+    lineRule: string;
+    before: string;
+    after: string;
+}
+
 /**
  * Options for {@link Paragraph.make} — a single-run, formatted paragraph factory.
  * Mirrors the hand-rolled `new Paragraph({...})` + applyStyle + setAlignment +
@@ -3089,6 +3445,35 @@ export declare function paragraphStyleId(xml: string): string | null;
 export declare function paragraphText(xml: string): string;
 
 /**
+ * Paragraph-property writers for STYLES and docDefaults, by string surgery.
+ *
+ * Pure: they take and return XML fragments (a `<w:pPr>` inner string), never
+ * touch a zip, and never go through xml2js (which regroups and trims). Every
+ * result is re-sorted into `CT_PPr` order, because Word rejects a sequence
+ * violation.
+ */
+export declare interface ParaStyleProps {
+    /** Line spacing as a MULTIPLE of single (1.5 → `w:line=360 w:lineRule=auto`). */
+    lineSpacing?: number;
+    beforePt?: number;
+    afterPt?: number;
+    jc?: "left" | "right" | "center" | "both" | "start" | "end";
+    /** First-line indent. Replaces any hanging indent. */
+    firstLineCm?: number;
+    /** Hanging indent. Replaces any first-line indent. */
+    hangingCm?: number;
+    /** Start-side indent (the right side in an RTL paragraph). */
+    startCm?: number;
+    /** `false` removes the element. */
+    keepNext?: boolean;
+    keepLines?: boolean;
+    /** `null` removes the element. */
+    outlineLvl?: number | null;
+    bidi?: boolean;
+    pageBreakBefore?: boolean;
+}
+
+/**
  * Read EVERY caption in one paragraph's XML — Word numbers each SEQ field it
  * finds, and real theses do put two figures on one line ("Figure 19: … Figure
  * 20: …"). Returns [] when the paragraph carries no caption field.
@@ -3129,21 +3514,29 @@ export declare function parseStylesIndex(stylesXml: string | null | undefined): 
  * needs a caption label at the very START of the paragraph plus either a number
  * or punctuation after it, and prose that runs on ("Figure 1 shows that …")
  * is rejected: with no punctuation the remainder must be short and must not
- * open with a lowercase word.
+ * open with a lowercase word. `known`: the caller already knows this paragraph
+ * is a caption (a role says so), so a numbered label is one whatever follows it.
  */
-export declare function parseTextCaption(text: string): TextCaptionMatch | null;
+export declare function parseTextCaption(text: string, opts?: {
+    known?: boolean;
+}): TextCaptionMatch | null;
 
 /** Convert pixels (96 DPI) to EMU. */
 export declare const pixelsToEmu: (px: number) => number;
 
 /** Raw parsed numbering parts (xml2js objects), for cross-document copy. */
 declare interface RawNumbering {
+    /** `<w:numPicBullet>`: the picture a level's `w:lvlPicBulletId` names. */
+    picBullets: any[];
     abstractNums: any[];
     nums: any[];
 }
 
 /** Read where the first drawing in `xml` is placed. `null` when there is none. */
 export declare function readDrawingLayout(xml: string): DrawingPlacement | null;
+
+/** fsType from the OS/2 table, or null when the buffer is not a usable sfnt. */
+export declare function readFsType(font: Buffer): number | null;
 
 /** Read back the effective (directly-set) pagination flags of a paragraph. */
 export declare function readParagraphPagination(xml: string): ParagraphPagination;
@@ -3201,6 +3594,31 @@ declare enum RelsType {
     Document = "word/_rels/document.xml.rels"
 }
 
+/** Paragraph properties that carry look. Without the `w:` prefix. */
+export declare const REMOVED_PARA_PROPS: readonly string[];
+
+/**
+ * Cut a typed label WORD ("جدول") off the front of a paragraph, together with the
+ * whitespace after it, so that a generated label can take its place instead of
+ * repeating it ("جدول 1: جدول الميزانية" -> "جدول 1: الميزانية").
+ *
+ * Run-level surgery on the paragraph's FIRST text run and nothing else. It cuts only
+ * when the word sits wholly at the start of that run's first `<w:t>`, is a whole word
+ * (whitespace or the end of the run after it), and more wording follows. Otherwise —
+ * the word split across runs, a different word that merely starts with it, a tab or
+ * a field or a hyperlink or a revision in front, the word standing alone — it returns
+ * the paragraph untouched with `dropped: false`. Every other run, bookmark and field
+ * is copied through byte for byte. A run that held nothing but the word disappears;
+ * a tatweel inside the word ("جـدول") does not stop it matching.
+ *
+ * Pure, so that a caller can ask what {@link CaptionManager.addGeneratedCaption} would
+ * do with `dropLeadingWord` without touching a document.
+ */
+export declare function removeLeadingWord(paragraphXml: string, word: string): {
+    xml: string;
+    dropped: boolean;
+};
+
 /** A chunk a {@link BlockRenderer} hook may return; insert offsets are local. */
 export declare interface RenderedChunk {
     paragraphs: Paragraph[];
@@ -3250,6 +3668,10 @@ export declare function renderMarkdownBlocks(blocks: MarkdownBlock[], ctx: Markd
  * somehow left a part unreadable, or turned a clean fatal into a new one, the
  * whole thing is discarded and the original bytes are returned. A doctor that
  * can corrupt a thesis is worse than no doctor.
+ *
+ * Zip flags are repaired too, and stay on the report as fixed `zip.*` findings.
+ * `repairedParts` keeps its meaning, parts rewritten: clearing a flag rewrites
+ * none, so go by `changed` for whether the bytes moved.
  */
 export declare function repairDocxBuffer(buffer: Buffer, opts?: {
     aggressive?: boolean;
@@ -3531,8 +3953,17 @@ declare interface RunProperties {
 export declare interface RunProps {
     /** Font family. Written to `w:ascii`, `w:hAnsi` AND `w:cs`. */
     font?: string;
-    /** Size in POINTS. Written as half-points to BOTH `w:sz` and `w:szCs`. */
+    /** Latin font only: `w:ascii` + `w:hAnsi`. Wins over `font` for those two. */
+    fontLatin?: string;
+    /** Complex-script (Arabic) font only: `w:cs`. Wins over `font` for `w:cs`. */
+    fontCs?: string;
+    /**
+     * Size in POINTS. Written as half-points to BOTH `w:sz` and `w:szCs` — unless
+     * `sizeCsPt` is also given, in which case this is `w:sz` only.
+     */
     sizePt?: number;
+    /** Complex-script size in POINTS: `w:szCs` only. */
+    sizeCsPt?: number;
     /** true writes `<w:b/><w:bCs/>`; false removes both. */
     bold?: boolean;
     /** true writes `<w:i/><w:iCs/>`; false removes both. */
@@ -3640,9 +4071,20 @@ export declare class SectionManager {
     private applyLayout;
     private findSectPr;
     getSections(): Promise<SectionEntry[]>;
-    addSectionBreak(paragraphIndex: number, type: "nextPage" | "continuous" | "evenPage" | "oddPage"): Promise<void>;
+    addSectionBreak(paragraphIndex: number, type: "nextPage" | "continuous" | "evenPage" | "oddPage", opts?: {
+        copyBodyGeometry?: boolean;
+    }): Promise<void>;
     removeSectionBreak(paragraphIndex: number): Promise<void>;
     setSectionLayout(sectionIndex: number, layout: SectionLayout): Promise<void>;
+    /**
+     * Set ONE section's page size and margins (`pgSz` / `pgMar`), byte-safe: only
+     * the named attributes change. Width/height are NOT swapped for `orient`.
+     */
+    setSectionGeometry(sectionIndex: number, geometry: SectPrGeometry): Promise<void>;
+    /** Remove `w:titlePg` ("different first page") from ONE section. */
+    removeTitlePg(sectionIndex: number): Promise<void>;
+    /** Drop every header/footer reference from ONE section's sectPr (the parts are left alone). */
+    removeSectionHeaderFooterRefs(sectionIndex: number): Promise<void>;
     setSectionHeader(sectionIndex: number, relId: string, type?: "default" | "first" | "even"): Promise<void>;
     setSectionFooter(sectionIndex: number, relId: string, type?: "default" | "first" | "even"): Promise<void>;
     /**
@@ -3676,6 +4118,8 @@ export declare class SectionManager {
      * are counted in document order: paragraph-level sectPrs first, final last —
      * the same order as getSections().
      */
+    /** A reference is written as `r:id`; a root that declares only `xmlns:w` would then be refused by Word. */
+    private declareRelationshipPrefix;
     private editSectionSectPr;
 }
 
@@ -3710,6 +4154,20 @@ export declare interface SectionPageSize {
     orientation?: "portrait" | "landscape";
 }
 
+/** Page geometry in twips. `orient` is written as given: swapping width/height is the caller's job. */
+export declare interface SectPrGeometry {
+    widthTw?: number;
+    heightTw?: number;
+    orient?: "portrait" | "landscape";
+    topTw?: number;
+    bottomTw?: number;
+    leftTw?: number;
+    rightTw?: number;
+    gutterTw?: number;
+    headerTw?: number;
+    footerTw?: number;
+}
+
 export declare interface SectPrPageBorderOptions {
     style: "single" | "double" | "thick" | "dashed" | "dotted";
     /** 6-hex, with or without a leading '#'. */
@@ -3734,57 +4192,24 @@ export declare function seqIdentifier(label: string): string;
 
 export declare function setParagraphText(paragraphXml: string, text: string): string;
 
-/**
- * docx-doctor — inspect a .docx package for the corruption classes that actually
- * bite this product, and mechanically repair the ones that can be repaired.
- *
- * ## Why this exists
- *
- * An AI edit writes real OOXML into a real student's thesis. When it writes the
- * wrong SHAPE, Word does not warn and does not repair — it refuses the file
- * outright ("Word experienced an error trying to open the file"), and the damage
- * is already on disk. Every defect below is one we have shipped at least once:
- *
- *  • **Schema sequence.** `w:tblPr`, `w:tcPr`, `w:pPr`, `w:sectPr` and `w:style`
- *    are `xsd:sequence` — child ORDER is a hard constraint, and `bidiVisual`
- *    after `tblW` killed an Arabic thesis. Well-formed ≠ valid, so `xmllint` sees
- *    nothing. (`w:rPr` and `w:trPr` are deliberately NOT checked: their schema
- *    types are repeated CHOICES, so their child order is free.)
- *  • **Story shape.** A story must not end with a table, and two adjacent tables
- *    merge into one. Word writes an empty `<w:p/>` at both spots; hand-built
- *    OOXML forgets to.
- *  • **Body order.** Any manager that round-trips `word/document.xml` through
- *    xml2js regroups `<w:body>` children BY TAG, hoisting every table above every
- *    paragraph. Block indices here are positional (op queue, RAG chunks, edits),
- *    so that silently rewires the whole document. Unfixable in place — the order
- *    is genuinely gone — so we detect it loudly and point at history restore.
- *  • **Dropped spaces.** The same xml2js path runs `trim:true`, which turns
- *    Word's inter-word space runs (`<w:t xml:space="preserve"> </w:t>`) into
- *    `<w:t/>`. Words glue together. We can't recover an emptied run, but we CAN
- *    stop the next save from dropping the spaces still present.
- *  • **Package integrity.** Dangling relationship targets, missing
- *    `[Content_Types].xml` overrides, duplicate rIds — each on its own makes Word
- *    refuse the document.
- *  • **Lying zip flags.** adm-zip re-writes a streamed archive keeping the
- *    "a data descriptor follows" flag it did not honour, and then cannot read its
- *    own output back. See `clearFalseDataDescriptors`.
- *
- * ## Shape of the module
- *
- * Pure functions over a duck-typed zip, exactly like `hf-part-repair.ts` (which
- * stays as the chrome-op fast path; both only ever move a part toward the same
- * canonical shape, so running either or both is idempotent). String surgery on
- * purpose: a parse/rebuild round-trip is the very thing that causes half the
- * defects listed above.
- *
- * `inspectDocx(zip)` reports. `inspectDocx(zip, { fix: true })` also repairs, in
- * place, and lists the parts it rewrote. `checkDocxBuffer` / `repairDocxBuffer`
- * are the byte-level wrappers; the repairing one re-opens its own output and
- * discards the whole repair unless every rewritten part still parses and no new
- * fatal appeared. Verified against real theses: four Word-authored student
- * documents come back completely clean and untouched, and a repair never changes
- * a single `<w:t>` payload — it only ever moves markup.
- */
+export declare class SettingsManager {
+    private zip;
+    constructor(zip: default_2);
+    /**
+     * Add, change or remove (`attrs === null`) ONE `word/settings.xml` element —
+     * e.g. `w:updateFields`, `w:mirrorMargins`, `w:evenAndOddHeaders`. A package
+     * with no settings part gets a minimal one (content type + relationship).
+     */
+    setSetting(name: string, attrs: Record<string, string> | null): Promise<{
+        changed: boolean;
+    }>;
+    /** The same for a whole element, children included, such as `w:footnotePr`. */
+    setSettingElement(name: string, element: string | null): Promise<{
+        changed: boolean;
+    }>;
+    private write;
+}
+
 /** `fatal` — the document is broken (Word refuses it, or its content order is
  *  destroyed). `warning` — wrong or degraded, but it still opens. */
 export declare type Severity = "fatal" | "warning";
@@ -3954,6 +4379,19 @@ export declare class StylesManager {
     setStyleRunProps(styleId: string, props: RunProps, ensure?: EnsureStyleSpec): Promise<{
         created: boolean;
         updated: boolean;
+    }>;
+    /** Write paragraph properties onto a style's `pPr` (string surgery). */
+    setStyleParagraphProps(styleId: string, props: ParaStyleProps, ensure?: EnsureStyleSpec): Promise<{
+        created: boolean;
+        updated: boolean;
+    }>;
+    /** Write `w:docDefaults` (fonts, sizes, language, line spacing). */
+    setDocDefaults(d: DocDefaultsInput): Promise<{
+        updated: boolean;
+    }>;
+    /** Create `styleId` if missing. NEVER modifies an existing style. */
+    ensureStyle(styleId: string, spec: EnsureStyleOptions): Promise<{
+        created: boolean;
     }>;
 }
 
@@ -4489,6 +4927,17 @@ export declare interface TargetStyleReport {
     mixed: boolean;
 }
 
+/**
+ * What the `TC` fields of a paragraph put in a table of contents. A title drawn in a shape (WordArt, a
+ * text box) is no text of its paragraph, so Word's `\\o` never collects it: a TC field is how it gets a
+ * line, on its true page, printing nothing. Word collects one only when its runs are NOT hidden, and the
+ * table's instruction carries `\\f`: measured in real Word, 2026-11-04.
+ */
+export declare function tcFieldEntries(paragraphXml: string): Array<{
+    text: string;
+    level: number;
+}>;
+
 export declare interface TextBoxOptions {
     text: string;
     position?: ShapePosition;
@@ -4509,6 +4958,12 @@ export declare interface TextCaptionMatch {
     separator: string;
     /** The caption wording after the label, number and separator. */
     text: string;
+    /**
+     * A list-style number typed BEFORE the label ("2- " in "2- جدول …"); "" when
+     * there is none. When the label carries no number of its own, `rawNumber`
+     * holds this one.
+     */
+    leadingNumber: string;
 }
 
 /**
@@ -4709,6 +5164,19 @@ export declare interface TypedTocSpan {
 }
 
 /**
+ * Namespace prefixes a part uses but never declares. Such a part is well-formed to a tag matcher, and
+ * Word refuses the whole file: a root that declares only `xmlns:w` (some generators write that) plus a
+ * section reference written as `r:id` is enough. `declareUsedPrefixes` is string surgery on the root
+ * tag only, so nothing else in the part moves.
+ */
+export declare interface UndeclaredPrefix {
+    prefix: string;
+    count: number;
+}
+
+export declare function undeclaredPrefixes(xml: string): UndeclaredPrefix[];
+
+/**
  * Rewrite a paragraph's `<w:pPr>` through `mutate`, which receives the current
  * inner XML ("" when the paragraph has no `w:pPr` yet) and returns the new one.
  * The result is canonicalised into `CT_PPr` order and written back; a `w:pPr`
@@ -4730,6 +5198,41 @@ export declare interface ValueShare {
     share: number;
 }
 
+export declare function wipeBlockPresentation(blockXml: string, opts?: WipeOptions): WipeResult;
+
+/**
+ * Presentation wipe: strip DIRECT formatting from one body block so a regenerated
+ * style cascade shows through, by string surgery only.
+ *
+ * Rescue rebuilds a thesis's formatting inside the student's own file. The
+ * xml2js-backed paths regroup `<w:body>` and trim spaces, so nothing here
+ * touches them: a block's XML goes in, a block's XML comes out, and every byte
+ * that is not a stripped property is copied through.
+ *
+ * What is kept is what carries MEANING (bold, italic, underline, script, text
+ * direction, language, character style, hidden text); what is removed is what
+ * carries LOOK (fonts, sizes, colours, spacing, alignment, indents).
+ *
+ * Never edited, whatever they contain: text boxes (`w:txbxContent`),
+ * `mc:AlternateContent`, `w:drawing`, math (`m:oMath*`) and field instructions
+ * (`w:instrText`). Those spans are lifted out before any rewrite and put back
+ * verbatim.
+ */
+export declare interface WipeOptions {
+    /** Remove `<w:br w:type="page"/>` and `<w:lastRenderedPageBreak/>`. Default true. */
+    removePageBreaks?: boolean;
+    /** Also remove a paragraph's own `w:sectPr` (a section break). Default false. */
+    removeParagraphSectPr?: boolean;
+}
+
+export declare interface WipeResult {
+    xml: string;
+    runsStripped: number;
+    paragraphsStripped: number;
+    pageBreaksRemoved: number;
+    sectPrRemoved: number;
+}
+
 declare type xmlFile = {
     fileName: string;
     xml: string;
@@ -4739,6 +5242,19 @@ declare type xmlFile_2 = {
     fileName: string;
     xml: string;
 };
+
+/** What a package's own zip headers get wrong, by entry name. */
+export declare interface ZipFlagReport {
+    /** Non-empty entries whose local header promises a descriptor that is not there.
+     *  Word refuses the whole file, even when it is a single entry. */
+    falseDescriptors: string[];
+    /** The same false promise where Word reads past it: an empty entry (a directory,
+     *  a zero-length file), or a flag standing only in the central directory. */
+    toleratedFalseDescriptors: string[];
+    /** Non-empty entries that record CRC 0. Word opens them; adm-zip and `unzip -t`
+     *  do not. Reported only: no flag explains it, so nothing here can repair it. */
+    zeroCrc: string[];
+}
 
 export declare class ZipManager extends default_2 {
     constructor(filePathOrBuffer?: string | Buffer);
